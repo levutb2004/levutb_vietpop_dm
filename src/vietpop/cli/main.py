@@ -482,7 +482,7 @@ def run(config_file: str,
 
     logger.info("Performing dasymetric mapping...")
     if model_type == 'bart': 
-        for prediction in predictions:
+        for prediction in predictions.values():
             mapper.map(prediction)
     else:
         mapper.map(predictions)

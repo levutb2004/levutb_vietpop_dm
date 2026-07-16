@@ -609,7 +609,7 @@ class DasymetricMapper:
             profile = src.profile.copy()
             profile.update({
                 'dtype': 'float32',  # Population counts should be integers
-                'nodata': -99,
+                'nodata': -9999,
                 'blockxsize': self.settings.block_size[0],
                 'blockysize': self.settings.block_size[1],
             })
