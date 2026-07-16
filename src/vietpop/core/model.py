@@ -1,4 +1,5 @@
 # src/vietpop/core/model.py
+import math
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -165,7 +166,7 @@ class Model:
                     scaler_path: Optional[str] = None,
                     log_scale: bool = False,
                     save_model: bool = True,
-                    draws: int = 1000,
+                    draws: int = 250,
                     tune: int = 1000,
                     chains: int = 4,
                     random_seed: int = 42) -> None:
@@ -568,7 +569,9 @@ class Model:
             dst_handles = {key: rasterio.open(path, 'w', **profile) for key, path in outfiles.items()}
             reading_lock = threading.Lock()
             writing_lock = threading.Lock()
-
+            # --- Progress tracking cho từng chunk (không phải từng block) ---
+            chunk_progress_lock = threading.Lock()
+            chunk_progress = {'done': 0, 'total': 0}  # 'total' sẽ được set trước khi chạy
             def process(window):
                 df = pd.DataFrame()
                 with reading_lock:
@@ -590,7 +593,6 @@ class Model:
                 if valid_idx.size > 0:
                     X_valid = df.iloc[valid_idx]
                     sx_full = self.scaler.transform(X_valid)
-
                     # --- Chia nhỏ theo CHUNK_SIZE, KHÔNG theo kích thước block raster ---
                     for start in range(0, len(valid_idx), CHUNK_SIZE):
                         end = start + CHUNK_SIZE
@@ -620,7 +622,13 @@ class Model:
 
                         # Giải phóng ngay, không giữ lại cho cả block
                         del samples, ppc
-
+                        with chunk_progress_lock:
+                                        chunk_progress['done'] += 1
+                                        if chunk_progress['done'] % 10 == 0 or chunk_progress['done'] == chunk_progress['total']:
+                                            logger.info(
+                                                f"Chunk progress: {chunk_progress['done']}/{chunk_progress['total']} "
+                                                f"({100*chunk_progress['done']/chunk_progress['total']:.1f}%)"
+                                            )
                 with writing_lock:
                     dst_handles["mean"].write(mean_arr.reshape(out_shape), window=window, indexes=1)
                     for p in percentiles:
@@ -631,7 +639,15 @@ class Model:
                 logger.info(f"Processing by blocks (chunk_size={CHUNK_SIZE} pixels/sampling call)")
                 block_windows = list(dst_handles["mean"].block_windows())
                 windows = [w for _, w in block_windows]
-
+                # Ước lượng tổng số chunk để log progress % chính xác
+                total_pixels = sum(w.width * w.height for w in windows)
+                estimated_total_chunks = math.ceil(total_pixels / CHUNK_SIZE)
+                logger.info(
+                    f"Processing by blocks: {len(windows)} blocks, "
+                    f"~{estimated_total_chunks} chunks (chunk_size={CHUNK_SIZE})"
+                )
+                chunk_progress = {'done': 0, 'total': estimated_total_chunks}
+                chunk_progress_lock = threading.Lock()
                 with ThreadPoolExecutor(max_workers=self.settings.max_workers) as executor:
                     list(progress_bar(
                         executor.map(process, windows),
