@@ -1,0 +1,67 @@
+# Python specific
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+popupy.egg-info
+
+# Virtual Environment
+venv/
+ENV/
+env/
+
+# IDE specific
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Project specific
+*.pkl
+*.pkl.gz
+/output/
+/data/
+/prj_vn_2019
+/eda
+tmp.csv
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+.hypothesis/
+
+# Sphinx documentation
+docs/_build/
+docs/_autosummary/
+*.doctree
+*.pickle
+/example_proj/
+
+# Keep documentation directories
+!docs/_static/
+!docs/_templates/
