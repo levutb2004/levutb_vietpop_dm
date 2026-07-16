@@ -166,9 +166,9 @@ class Model:
                     scaler_path: Optional[str] = None,
                     log_scale: bool = False,
                     save_model: bool = True,
-                    draws: int = 250,
+                    draws: int = 500,
                     tune: int = 1000,
-                    chains: int = 4,
+                    chains: int = 2,
                     random_seed: int = 42) -> None:
         """
         Train PyMC-BART model for population density prediction.

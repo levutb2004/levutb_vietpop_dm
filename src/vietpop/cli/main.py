@@ -243,9 +243,9 @@ def train(config_file: str,
                 scaler_path=getattr(settings, 'bart_scaler_path', None),
                 log_scale=settings.log_scale,
                 save_model=True,
-                draws=getattr(settings, 'draws', 1000),
+                draws=getattr(settings, 'draws', 500),
                 tune=getattr(settings, 'tune', 1000),
-                chains=getattr(settings, 'chains', 4),
+                chains=getattr(settings, 'chains', 2),
                 random_seed=getattr(settings, 'random_seed', 42),
             )
         else:
@@ -481,7 +481,11 @@ def run(config_file: str,
     mapper = DasymetricMapper(settings)
 
     logger.info("Performing dasymetric mapping...")
-    mapper.map(predictions)
+    if model_type == 'bart': 
+        for prediction in predictions:
+            mapper.map(prediction)
+    else:
+        mapper.map(predictions)
 
     if not no_viz:
         logger.info("Creating visualization...")
