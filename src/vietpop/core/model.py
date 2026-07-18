@@ -2,6 +2,8 @@
 import math
 import numpy as np
 import pandas as pd
+import copy
+from pymc_bart.utils import _sample_posterior
 import matplotlib.pyplot as plt
 from pathlib import Path
 import joblib
@@ -166,7 +168,7 @@ class Model:
                     scaler_path: Optional[str] = None,
                     log_scale: bool = False,
                     save_model: bool = True,
-                    draws: int = 500,
+                    draws: int = 250,
                     tune: int = 1000,
                     chains: int = 2,
                     random_seed: int = 42) -> None:
@@ -525,24 +527,17 @@ class Model:
         # độc lập với block_size dùng để đọc/ghi raster.
         # Có thể override qua config: settings.bart_predict_chunk_size
         CHUNK_SIZE = getattr(self.settings, 'bart_predict_chunk_size', 50_000)
-
+        draws = self.trace.posterior.sizes["draw"]
+        chains = self.trace.posterior.sizes["chain"]
         src = {}
         mst = None
         thread_local = threading.local()
-
+        
         def get_thread_model(n_rows: int, n_features: int):
             """Mỗi thread build model riêng, cache theo n_rows để tái sử dụng
             (đa số chunk sẽ có n_rows == CHUNK_SIZE nên cache hit hầu hết thời gian)."""
-            if not hasattr(thread_local, "model") or thread_local.n_rows != n_rows:
-                with pm.Model() as m:
-                    X_data = pm.Data("X_data", np.zeros((n_rows, n_features)))
-                    y_data = pm.Data("y_data", np.zeros(n_rows))
-                    sigma = pm.HalfNormal("sigma", sigma=1.0)
-                    mu = pmb.BART("mu", X_data, y_data, m=50)
-                    pm.Normal("y_obs", mu=mu, sigma=sigma, observed=y_data, shape=mu.shape)
-                thread_local.model = m
-                thread_local.n_rows = n_rows
-            return thread_local.model
+            cloned_model = copy.deepcopy(self.model)
+            return cloned_model
 
         try:
             logger.debug("Opening covariate rasters")
@@ -603,16 +598,14 @@ class Model:
                         thread_model = get_thread_model(n_valid, sx.shape[1])
 
                         with thread_model:
-                            pm.set_data({"X_data": sx, "y_data": np.zeros(n_valid)})
-                            ppc = pm.sample_posterior_predictive(
-                                self.trace,
-                                var_names=["y_obs"],
-                                predictions=True,
-                                progressbar=False,
+                            samples = _sample_posterior(
+                            all_trees=thread_model.mu.owner.op.all_trees,
+                            X=sx,                    # (50000, n_features)
+                            rng=np.random.default_rng(42),
+                            size=draws*chains
                             )
 
-                        samples = ppc.predictions["y_obs"].values
-                        samples = samples.reshape(-1, samples.shape[-1])
+                        samples = samples.squeeze(-1)
                         if log_scale:
                             samples = np.exp(samples)
 
@@ -762,11 +755,12 @@ class Model:
     def _save_bart_model(self):
         output_dir = Path(self.settings.work_dir) / 'output'
         output_dir.mkdir(exist_ok=True)
-
+        #model_path = self.output_dir / f'{self.model_type}.pkl.gz'
+        #joblib.dump(self.model, model_path)
+        #logger.debug(f"Model saved to: {model_path}")
         trace_path = output_dir / f'{self.model_type}.nc'
         az.to_netcdf(self.trace, trace_path)
         logger.info(f"Trace saved to: {trace_path}")
-
         scaler_path = output_dir / f'{self.model_type}_scaler.pkl.gz'
         joblib.dump(self.scaler, scaler_path)
         logger.info(f"Scaler saved to: {scaler_path}")

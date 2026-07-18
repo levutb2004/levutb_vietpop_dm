@@ -13,7 +13,7 @@ MODEL=bart
 # Default target
 train:
 	@echo "Training model..."
-	set PYTHONPATH=$(PYTHONPATH) && $(PYTHON) -m $(SCRIPT) train -c $(CONFIG) --verbose --model-type $(MODEL)
+	set PYTHONPATH=$(PYTHONPATH) && $(PYTHON) -m $(SCRIPT) train -c $(CONFIG) --verbose --no-viz --model-type $(MODEL)
 
 trainmlp:
 	@echo "Training model..."
