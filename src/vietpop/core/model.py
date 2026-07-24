@@ -232,9 +232,6 @@ class Model:
                 sigma = pm.HalfNormal("sigma", sigma=y.std())
                 mu = pmb.BART("mu", X_data, y_data, m=50)
 
-                likelihood = pm.Normal("y_obs", mu=mu, sigma=sigma,
-                                        observed=y_data, shape=mu.shape)
-
                 logger.info("Sampling started")
                 idata = pm.sample(
                     draws=draws,
@@ -599,22 +596,22 @@ class Model:
 
                         with thread_model:
                             samples = _sample_posterior(
-                            all_trees=thread_model.mu.owner.op.all_trees,
+                            all_trees=thread_model.mu.owner.op.all_trees, #toàn bộ số models = chains * draws
                             X=sx,                    # (50000, n_features)
                             rng=np.random.default_rng(42),
-                            size=draws*chains
-                            )
-
+                            size=100 # lấy ngẫu nhiên 100 models trong tổng số models
+                            ) #kết quả sẽ là bộ 100 kết quả dự đoán của 100 models đã lấy, mỗi kết quả là 50000 pixel
+                            
                         samples = samples.squeeze(-1)
                         if log_scale:
                             samples = np.exp(samples)
 
-                        mean_arr[idx_chunk] = samples.mean(axis=0)
-                        for p in percentiles:
-                            pct_arrs[p][idx_chunk] = np.percentile(samples, p, axis=0)
+                        mean_arr[idx_chunk] = samples.mean(axis=0) #lấy mean của từng pixel trên bộ dự đoán
+                        for p in percentiles: #lấy 2.5 percentile và 97.5 percentile của từng pixel trên bộ dự đoán
+                            pct_arrs[p][idx_chunk] = np.percentile(samples, p, axis=0)  
 
                         # Giải phóng ngay, không giữ lại cho cả block
-                        del samples, ppc
+                        del samples
                         with chunk_progress_lock:
                                         chunk_progress['done'] += 1
                                         if chunk_progress['done'] % 10 == 0 or chunk_progress['done'] == chunk_progress['total']:

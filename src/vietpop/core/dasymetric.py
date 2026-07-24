@@ -127,7 +127,7 @@ class DasymetricMapper:
             raise ValueError(error_msg)
 
         # Check for compatible transforms
-        if tgt_profile['transform'] != src_profile['transform']:
+        if not tgt_profile['transform'].almost_equals(src_profile['transform']):
             error_msg = f"Transform mismatch between {labels[1]} and {labels[0]}"
             logger.error(error_msg)
             raise ValueError(error_msg)
@@ -663,7 +663,8 @@ class DasymetricMapper:
         return str(output_path)
 
     def map(self,
-            prediction_path: str) -> str:
+            prediction_path: str,
+            suffix: str = '') -> str:
         """
         Perform dasymetric mapping using prediction raster and census data.
 
@@ -707,6 +708,7 @@ class DasymetricMapper:
         final_raster_path = self._create_dasymetric_raster(
             prediction_path,
             norm_raster_path, 
+            suffix,
             constrained=False
         )
 

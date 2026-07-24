@@ -487,9 +487,15 @@ def run(config_file: str,
     logger.info("Performing dasymetric mapping...")
     if model_type == 'bart': 
         for prediction in predictions.values():
-            mapper.map(prediction)
+            if settings.district_dm:
+                logger.info("Using district-level dasymetric mapping (map_district)")
+                mapper.map_district(prediction)
+            else: mapper.map(predictions)
     else:
-        mapper.map(predictions)
+        if settings.district_dm:
+            logger.info("Using district-level dasymetric mapping (map_district)")
+            mapper.map_district(prediction)
+        else: mapper.map(predictions)
 
     if not no_viz:
         logger.info("Creating visualization...")

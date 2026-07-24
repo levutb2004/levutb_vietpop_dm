@@ -59,5 +59,5 @@ predictndm:
 
 commpopdiag:
 	@echo "Running commune-level diagnostics..."
-	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m $(SCRIPT) commpopdiag -c $(CONFIG) -m prj_vn_2019/output/$(MODEL).pkl.gz --verbose
+	set PYTHONPATH=$(PYTHONPATH) && $(PYTHON) -m $(SCRIPT) commpopdiag -c $(CONFIG) -m prj_vn_2019/output/$(MODEL).pkl.gz --verbose
 
