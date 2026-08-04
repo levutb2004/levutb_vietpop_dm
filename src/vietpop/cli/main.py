@@ -9,7 +9,7 @@ from pathlib import Path
 import geopandas as gpd
 from libpysal.weights import Queen
 
-from vietpop.core.diagnostics import CommPopDiagnostics, ResidualDiagnostics
+from vietpop.core.diagnostics import CommPopDiagnostics, ResidualDiagnostics, PixelPopDiagnostics
 from vietpop.utils.config_utils import create_config_template
 from vietpop.utils.logger import get_logger
 from ..config.settings import Settings
@@ -470,7 +470,7 @@ def run(config_file: str,
             features = pd.read_pickle(pickle_path)
         else:
             logger.info("Starting feature extraction...")
-            features = feature_extractor.extract()
+            features = feature_extractor.extract(pixel_sample=False)
         if model_type == 'bart':
             model.bart_train(features, log_scale=settings.log_scale)
         else:
@@ -485,16 +485,10 @@ def run(config_file: str,
     mapper = DasymetricMapper(settings)
 
     logger.info("Performing dasymetric mapping...")
-    if model_type == 'bart': 
-        for prediction in predictions.values():
-            if settings.district_dm:
-                logger.info("Using district-level dasymetric mapping (map_district)")
-                mapper.map_district(prediction)
-            else: mapper.map(predictions)
-    else:
+    if model_type != 'bart':
         if settings.district_dm:
             logger.info("Using district-level dasymetric mapping (map_district)")
-            mapper.map_district(prediction)
+            mapper.map_district(predictions)
         else: mapper.map(predictions)
 
     if not no_viz:
@@ -707,7 +701,82 @@ def commpopdiag(config_file: str, model_path: str, verbose: bool) -> None:
 
 
 
+@cli.command()
+@click.option('-c', '--config', 'config_file',
+              type=click.Path(exists=True),
+              required=True,
+              help='Path to configuration file')
+@click.option('-m', '--model', 'model_path',
+              type=click.Path(exists=True),
+              help='Path to model pickle')
+@click.option('-v', '--verbose',
+              is_flag=True,
+              help='Show detailed information')
+def pixelpopdiag(config_file: str, model_path: str, verbose: bool) -> None:
+    """
+    Evaluate pixel-level population mapping diagnostics and log results.
+    """
+    logger.info(f"Starting pixel-level diagnostics with config: {config_file}")
 
+    settings = Settings.from_file(config_file)
+    if verbose:
+        logger.set_level('DEBUG')
+    output_dir = Path(settings.work_dir) / 'output'
+    output_dir.mkdir(exist_ok=True)
+    model_type = Path(model_path).stem.replace('.pkl', '')
+    setup_mlflow(work_dir=str(settings.work_dir))
+    with start_run(command='pixelpopdiag',
+                   model_type=model_type,
+                   config_file=config_file):
+        diag = PixelPopDiagnostics(settings)
+        if model_type == 'bart':
+            results = diag.evaluatePI()
+        else: 
+            results = diag.evaluate()
+        logger.info("PixelPopDiagnostics: Evaluation Results:")
+        for k, v in results.items():
+            logger.info(f"  {k}: {v}")
+
+        log_settings(settings)
+        mlflow.log_metrics({k: float(v) for k, v in results.items() if isinstance(v, (int, float))})
+        if 'csv' in results and results['csv']:
+            mlflow.log_artifact(results['csv'], artifact_path='csv')
+            logger.info(f"PixelPopDiagnostics: Output saved to MLflow: {results['csv']}")
+        log_log_file(settings.logging['file'] if hasattr(settings, 'logging') and settings.logging else None)
+   
+
+    logger.info("Pixel-level diagnostics completed successfully!")
+@cli.command()
+@click.option('-c', '--config', 'config_file',
+              type=click.Path(exists=True),
+              required=True,
+              help='Path to configuration file')
+@click.option('-p', '--predictions', 'predictions_file',
+              type=click.Path(exists=True),
+              required=True,
+              help='Path to model predictions (raster or array)')
+@click.option('-d', '--district', 'district_dm',
+              is_flag=True,
+              help='Use district-level dasymetric mapping')
+@click.option('-v', '--verbose',
+              is_flag=True,
+              help='Show detailed information')
+def dasymetric(config_file: str,
+                prediction_path: str,
+                district_dm: bool,
+                verbose: bool) -> None:
+    """Run dasymetric mapping to redistribute predictions to match census totals."""
+    settings = Settings.from_file(config_file)
+
+    mapper = DasymetricMapper(settings)
+
+    logger.info("Performing dasymetric mapping...")
+    if settings.district_dm:
+        logger.info("Using district-level dasymetric mapping (map_district)")
+        mapper.map_district(prediction_path)
+    else: mapper.map(prediction_path)
+
+    logger.info("Dasymetric mapping complete. Output saved to %s", settings.output_path)
 @cli.command()
 @click.option('-c', '--config', 'config_file',
             type=click.Path(exists=True),

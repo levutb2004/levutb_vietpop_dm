@@ -3,6 +3,7 @@ import math
 import numpy as np
 import pandas as pd
 import copy
+import scipy.ndimage as ndimage
 from pymc_bart.utils import _sample_posterior
 import matplotlib.pyplot as plt
 from pathlib import Path
@@ -15,6 +16,7 @@ from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import cross_validate
 from sklearn.inspection import permutation_importance
 from .base_model import BaseEstimator, GLMEstimator, RandomForestEstimator  # thêm import
+from rasterio.windows import Window
 import pymc as pm
 import pymc_bart as pmb
 import arviz as az
@@ -25,6 +27,7 @@ from ..utils.matplotlib_utils import with_non_interactive_matplotlib
 from ..utils.raster_processing import progress_bar
 from concurrent.futures import ThreadPoolExecutor
 from .diagnostics import ResidualDiagnostics
+
 
 logger = get_logger()
 
@@ -90,7 +93,7 @@ class Model:
         if self._estimator.requires_admin_id and 'id' in data.columns:
             self._estimator.set_admin_ids(data['id'].values)
 
-        drop_cols = np.intersect1d(data.columns.values, ['id', 'pop', 'dens'])
+        drop_cols = np.intersect1d(data.columns.values, ['id', 'pop', 'dens','is_commune'])
         X = data.drop(columns=drop_cols).copy()
         y = data['dens'].values
         if log_scale:
@@ -194,7 +197,7 @@ class Model:
         if self._estimator.requires_admin_id and 'id' in data.columns:
             self._estimator.set_admin_ids(data['id'].values)
 
-        drop_cols = np.intersect1d(data.columns.values, ['id', 'pop', 'dens'])
+        drop_cols = np.intersect1d(data.columns.values, ['id', 'pop', 'dens', 'is_commune'])
         X = data.drop(columns=drop_cols).copy()
         y = data['dens'].values.astype(float)
 
@@ -231,6 +234,7 @@ class Model:
 
                 sigma = pm.HalfNormal("sigma", sigma=y.std())
                 mu = pmb.BART("mu", X_data, y_data, m=50)
+                likelihood = pm.Normal("y_obs", mu=mu, sigma=sigma, observed=y_data)
 
                 logger.info("Sampling started")
                 idata = pm.sample(
@@ -500,56 +504,46 @@ class Model:
         logger.info("Prediction completed successfully")
         return str(outfile)
     @with_non_interactive_matplotlib
-    def predict_bart_grid(self,
-                        log_scale: bool = False) -> str:
-        """
-        Generate predictions using trained model for grid raster.
+    def predict_bart_grid(self, log_scale: bool = False) -> dict:
+        """ Dự đoán BART theo từng quận/huyện (dựa trên mastergrid) và scale
+        kết quả để tổng dân số dự đoán trong mỗi quận/huyện khớp với census.
 
         Returns:
-            str: Path to output prediction raster file
-
-        Raises:
-            RuntimeError: If model is not trained
-            FileNotFoundError: If input rasters are missing
+            dict: đường dẫn các raster output (mean, p2.5, p97.5)
         """
-        logger.info("Starting BART prediction generation")
+        logger.info("Starting BART prediction with district-level dasymetric mapping")
 
         if self.model is None or self.trace is None or self.scaler is None:
-            logger.error("Model not trained. Call bart_train() first")
             raise RuntimeError("Model not trained. Call bart_train() first.")
 
         percentiles = [2.5, 97.5]
 
-        # Kích thước batch tối đa cho MỖI lần gọi sample_posterior_predictive,
-        # độc lập với block_size dùng để đọc/ghi raster.
-        # Có thể override qua config: settings.bart_predict_chunk_size
-        CHUNK_SIZE = getattr(self.settings, 'bart_predict_chunk_size', 50_000)
-        draws = self.trace.posterior.sizes["draw"]
-        chains = self.trace.posterior.sizes["chain"]
+        id_col = self.settings.district_census['id_column']
+        pop_col = self.settings.district_census['pop_column']
+
+        # --- Load census: dict {district_id: population} ---
+        census_source = self.settings.district_census['path']
+        census_df = pd.read_csv(census_source)
+        census = dict(zip(census_df[id_col], census_df[pop_col]))
+
         src = {}
         mst = None
+        dst_handles = {}
         thread_local = threading.local()
-        
-        def get_thread_model(n_rows: int, n_features: int):
-            """Mỗi thread build model riêng, cache theo n_rows để tái sử dụng
-            (đa số chunk sẽ có n_rows == CHUNK_SIZE nên cache hit hầu hết thời gian)."""
-            cloned_model = copy.deepcopy(self.model)
-            return cloned_model
-
+        def get_thread_model():
+                """Mỗi thread cần model riêng vì pymc Model context manager không thread-safe."""
+                return copy.deepcopy(self.model)
         try:
             logger.debug("Opening covariate rasters")
             for k in self.settings.covariate:
                 src[k] = rasterio.open(self.settings.covariate[k], 'r')
 
             logger.debug("Opening mastergrid")
-            mst = rasterio.open(self.settings.mastergrid, 'r')
+            mst = rasterio.open(self.settings.district_mastergrid, 'r')
+            mst_arr = mst.read(1)  # load toàn bộ mastergrid vào RAM (raster 100m/VN ~ vài trăm MB, chấp nhận được)
 
             profile = mst.profile.copy()
-            profile.update({
-                'dtype': 'float32',
-                'blockxsize': self.settings.block_size[0],
-                'blockysize': self.settings.block_size[1],
-            })
+            profile.update({'dtype': 'float32'})
 
             names = self.selected_features
             base_outfile = Path(self.settings.output_raster['prediction'])
@@ -558,25 +552,47 @@ class Model:
                 tag = f"p{str(p).replace('.', '')}"
                 outfiles[tag] = base_outfile.with_name(f"{base_outfile.stem}_{tag}.tif")
 
-            dst_handles = {key: rasterio.open(path, 'w', **profile) for key, path in outfiles.items()}
+            dst_handles = {key: rasterio.open(path, 'w+', **profile) for key, path in outfiles.items()}
             reading_lock = threading.Lock()
             writing_lock = threading.Lock()
-            # --- Progress tracking cho từng chunk (không phải từng block) ---
-            chunk_progress_lock = threading.Lock()
-            chunk_progress = {'done': 0, 'total': 0}  # 'total' sẽ được set trước khi chạy
-            def process(window):
-                df = pd.DataFrame()
+            nodata = profile.get('nodata', -9999.0)
+
+            # --- Ghi nodata cho toàn bộ raster trước, sau đó ghi đè theo từng quận ---
+            init_arr = np.full((mst.height, mst.width), nodata, dtype='float32')
+            for handle in dst_handles.values():
+                handle.write(init_arr, indexes=1)
+            del init_arr
+
+            # --- Bounding box mỗi district bằng scipy.ndimage.find_objects (rất nhanh) ---
+            max_label = int(np.nanmax(mst_arr))
+            objects = ndimage.find_objects(mst_arr.astype(np.int32), max_label=max_label)
+
+            district_ids = [d for d in census.keys()
+                            if 0 < d <= max_label and objects[int(d) - 1] is not None]
+            logger.info(f"Processing {len(district_ids)} districts (of {len(census)} in census table)")
+
+            progress_lock = threading.Lock()
+            progress = {'done': 0, 'total': len(district_ids)}
+
+
+            def process_district(district_id):
+                row_slice, col_slice = objects[int(district_id) - 1]
+                window = Window(col_slice.start, row_slice.start,
+                                col_slice.stop - col_slice.start,
+                                row_slice.stop - row_slice.start)
+
+                mst_win = mst_arr[row_slice, col_slice]
+                district_mask = (mst_win == district_id)
+                out_shape = mst_win.shape
                 with reading_lock:
+                    df = pd.DataFrame()
                     for s in src:
-                        arr = src[s].read(window=window)[0, :, :]
+                        arr = src[s].read(1, window=window)
                         df[s + '_avg'] = arr.flatten()
+                    df = df[names]
 
-                df = df[names]
-                valid_mask = df.notna().all(axis=1).values
+                valid_mask = df.notna().all(axis=1).values & district_mask.flatten()
                 n_pixels = len(df)
-                out_shape = arr.shape
-                nodata = profile.get('nodata', -9999.0)
-
                 mean_arr = np.full(n_pixels, nodata, dtype='float32')
                 pct_arrs = {p: mean_arr.copy() for p in percentiles}
 
@@ -584,74 +600,65 @@ class Model:
 
                 if valid_idx.size > 0:
                     X_valid = df.iloc[valid_idx]
-                    sx_full = self.scaler.transform(X_valid)
-                    # --- Chia nhỏ theo CHUNK_SIZE, KHÔNG theo kích thước block raster ---
-                    for start in range(0, len(valid_idx), CHUNK_SIZE):
-                        end = start + CHUNK_SIZE
-                        sx = sx_full[start:end]
-                        idx_chunk = valid_idx[start:end]
-                        n_valid = len(sx)
+                    sx = self.scaler.transform(X_valid)
+                    thread_model = get_thread_model()
 
-                        thread_model = get_thread_model(n_valid, sx.shape[1])
-
-                        with thread_model:
-                            samples = _sample_posterior(
-                            all_trees=thread_model.mu.owner.op.all_trees, #toàn bộ số models = chains * draws
-                            X=sx,                    # (50000, n_features)
+                    with thread_model:
+                        samples = _sample_posterior(
+                            all_trees=thread_model.mu.owner.op.all_trees,
+                            X=sx,
                             rng=np.random.default_rng(42),
-                            size=100 # lấy ngẫu nhiên 100 models trong tổng số models
-                            ) #kết quả sẽ là bộ 100 kết quả dự đoán của 100 models đã lấy, mỗi kết quả là 50000 pixel
-                            
-                        samples = samples.squeeze(-1)
-                        if log_scale:
-                            samples = np.exp(samples)
+                            size=100
+                        )
+                    samples = samples.squeeze(-1)
+                    if log_scale:
+                        samples = np.exp(samples)
 
-                        mean_arr[idx_chunk] = samples.mean(axis=0) #lấy mean của từng pixel trên bộ dự đoán
-                        for p in percentiles: #lấy 2.5 percentile và 97.5 percentile của từng pixel trên bộ dự đoán
-                            pct_arrs[p][idx_chunk] = np.percentile(samples, p, axis=0)  
+                    mean_arr[valid_idx] = samples.mean(axis=0)
+                    for p in percentiles:
+                        pct_arrs[p][valid_idx] = np.percentile(samples, p, axis=0)
+                    del samples
 
-                        # Giải phóng ngay, không giữ lại cho cả block
-                        del samples
-                        with chunk_progress_lock:
-                                        chunk_progress['done'] += 1
-                                        if chunk_progress['done'] % 10 == 0 or chunk_progress['done'] == chunk_progress['total']:
-                                            logger.info(
-                                                f"Chunk progress: {chunk_progress['done']}/{chunk_progress['total']} "
-                                                f"({100*chunk_progress['done']/chunk_progress['total']:.1f}%)"
-                                            )
+                    # --- Dasymetric: scale để tổng dự đoán khớp với census của quận/huyện ---
+                    predicted_total = mean_arr[valid_idx].sum()
+                    census_total = census[district_id]
+                    if predicted_total > 0:
+                        factor = census_total / predicted_total
+                    else:
+                        logger.warning(f"District {district_id}: predicted_total=0, bỏ qua scaling")
+                        factor = 0.0
+
+                    mean_arr[valid_idx] *= factor
+                    for p in percentiles:
+                        pct_arrs[p][valid_idx] *= factor
+
+                # --- Ghi kết quả: read-modify-write vì bbox các quận có thể chồng nhau ---
                 with writing_lock:
-                    dst_handles["mean"].write(mean_arr.reshape(out_shape), window=window, indexes=1)
+                    existing_mean = dst_handles["mean"].read(1, window=window)
+                    new_mean = np.where(district_mask, mean_arr.reshape(out_shape), existing_mean)
+                    dst_handles["mean"].write(new_mean, window=window, indexes=1)
                     for p in percentiles:
                         tag = f"p{str(p).replace('.', '')}"
-                        dst_handles[tag].write(pct_arrs[p].reshape(out_shape), window=window, indexes=1)
+                        existing = dst_handles[tag].read(1, window=window)
+                        new_val = np.where(district_mask, pct_arrs[p].reshape(out_shape), existing)
+                        dst_handles[tag].write(new_val, window=window, indexes=1)
 
-            if self.settings.by_block:
-                logger.info(f"Processing by blocks (chunk_size={CHUNK_SIZE} pixels/sampling call)")
-                block_windows = list(dst_handles["mean"].block_windows())
-                windows = [w for _, w in block_windows]
-                # Ước lượng tổng số chunk để log progress % chính xác
-                total_pixels = sum(w.width * w.height for w in windows)
-                estimated_total_chunks = math.ceil(total_pixels / CHUNK_SIZE)
-                logger.info(
-                    f"Processing by blocks: {len(windows)} blocks, "
-                    f"~{estimated_total_chunks} chunks (chunk_size={CHUNK_SIZE})"
-                )
-                chunk_progress = {'done': 0, 'total': estimated_total_chunks}
-                chunk_progress_lock = threading.Lock()
-                with ThreadPoolExecutor(max_workers=self.settings.max_workers) as executor:
-                    list(progress_bar(
-                        executor.map(process, windows),
-                        self.settings.show_progress,
-                        len(windows),
-                        desc="BART Prediction"
-                    ))
-            else:
-                logger.info("Processing entire raster at once (chunked internally)")
-                full_window = Window(0, 0, dst_handles["mean"].width, dst_handles["mean"].height)
-                process(full_window)
+                with progress_lock:
+                    progress['done'] += 1
+                    if progress['done'] % 10 == 0 or progress['done'] == progress['total']:
+                        logger.info(f"District progress: {progress['done']}/{progress['total']} "
+                                    f"({100*progress['done']/progress['total']:.1f}%)")
+
+            with ThreadPoolExecutor(max_workers=self.settings.max_workers) as executor:
+                list(progress_bar(
+                    executor.map(process_district, district_ids),
+                    self.settings.show_progress,
+                    len(district_ids),
+                    desc="BART Dasymetric Prediction"
+                ))
 
         except Exception as e:
-            logger.error(f"Error during prediction: {str(e)}")
+            logger.error(f"Error during dasymetric prediction: {str(e)}")
             import traceback
             logger.error(f"Full traceback: {traceback.format_exc()}")
             raise
@@ -672,7 +679,7 @@ class Model:
                 except Exception as e:
                     logger.warning(f"Error closing output raster: {str(e)}")
 
-        logger.info("BART prediction completed successfully")
+        logger.info("BART dasymetric prediction completed successfully")
         return {k: str(v) for k, v in outfiles.items()}
 
     @with_non_interactive_matplotlib

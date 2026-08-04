@@ -4,9 +4,9 @@ PYTHON=python
 SCRIPT=vietpop.cli.main
 CONFIG=prj_vn_2019/config.yaml
 # MODEL=lr
-#MODEL=rf
-#MODEL=ensemble
 MODEL=bart
+#MODEL=ensemble
+#MODEL=bart
 # MODEL=mlp
 # MODEL=glm
 
@@ -60,4 +60,9 @@ predictndm:
 commpopdiag:
 	@echo "Running commune-level diagnostics..."
 	set PYTHONPATH=$(PYTHONPATH) && $(PYTHON) -m $(SCRIPT) commpopdiag -c $(CONFIG) -m prj_vn_2019/output/$(MODEL).pkl.gz --verbose
+
+pixelpopdiag:
+	@echo "Running pixel-level diagnostics..."
+	set PYTHONPATH=$(PYTHONPATH) && $(PYTHON) -m $(SCRIPT) pixelpopdiag -c $(CONFIG) -m prj_vn_2019/output/$(MODEL).pkl.gz --verbose
+
 

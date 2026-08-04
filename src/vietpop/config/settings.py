@@ -51,6 +51,7 @@ class Settings:
                  district_mastergrid: Optional[str] = None,
                  mask: Optional[str] = None,
                  constrain: Optional[str] = None,
+                 ground_truth: Optional[str] = None,
                  covariates: Optional[Dict[str, str]] = None,
                  census_data: Optional[str] = None,
                  census_pop_column: Optional[str] = None,
@@ -132,6 +133,12 @@ class Settings:
         if self.constrain:
             if not Path(self.constrain).is_absolute():
                 self.constrain = str(self.data_dir / constrain)
+                
+        # Handle ground truth path
+        self.ground_truth = str(Path(ground_truth)) if ground_truth else None
+        if self.ground_truth:
+            if not Path(self.ground_truth).is_absolute():
+                self.ground_truth = str(self.data_dir / ground_truth)
 
         # Process covariate paths
         self.covariate = {}
@@ -465,6 +472,7 @@ class Settings:
             f"  Mastergrid: {self.mastergrid}\n"
             f"  Mask: {self.mask}\n"
             f"  Constrain: {self.constrain}\n"
+            f"  Ground Truth: {self.ground_truth}\n"
             f"  Covariates:\n    {covariate_str}\n"
             f"  Census:\n"
             f"    Path: {self.census['path']}\n"

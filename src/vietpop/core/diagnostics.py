@@ -1,5 +1,6 @@
 import numpy as np
 import pandas as pd
+import rasterio
 from typing import Optional, Any
 from scipy.stats import skew, kurtosis
 from libpysal.weights import Queen, W
@@ -207,7 +208,7 @@ class CommPopDiagnostics:
         n = len(y_true)
         rmsd = np.sqrt(np.mean((y_pred - y_true) ** 2))
         percent_rmsd = 100 * rmsd / np.mean(y_true) if np.mean(y_true) != 0 else np.nan
-        mad = np.mean(np.abs(y_pred - y_true))
+        mae = np.mean(np.abs(y_pred - y_true))
         ss_res = np.sum((y_true - y_pred) ** 2)
         ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
         r2 = 1 - ss_res / ss_tot if ss_tot > 0 else np.nan
@@ -217,8 +218,196 @@ class CommPopDiagnostics:
         return {
             'RMSD': rmsd,
             'PercentRMSD': percent_rmsd,
-            'MAD': mad,
+            'MAE': mae,
             'R2': r2,
             'n': n,
             'csv': str(output_csv)
+        }
+class PixelPopDiagnostics:
+    """
+    Evaluate population mapping results at the pixel level,
+    including prediction-interval (PI) diagnostics.
+    """
+    def __init__(self, settings):
+        self.settings = settings
+
+    def evaluatePI(self):
+        logger.info("PixelPopDiagnostics: Starting evaluation...")
+
+        # 1. Lấy đường dẫn raster từ settings (đã có sẵn: ground_truth, mean, lower, upper)
+        gt_path = self.settings.ground_truth
+        mean_path = self.settings.output_raster.get('mean')
+        lower_path = self.settings.output_raster.get('lower')   # percentile 2.5
+        upper_path = self.settings.output_raster.get('upper')   # percentile 97.5
+
+        for name, p in [('ground_truth', gt_path), ('mean', mean_path),
+                         ('lower', lower_path), ('upper', upper_path)]:
+            if not p or not Path(p).is_file():
+                logger.error(f"{name} raster not found: {p}")
+                raise FileNotFoundError(f"{name} raster not found: {p}")
+
+        # 2. Đọc raster pixel-level
+        logger.info("PixelPopDiagnostics: Reading rasters...")
+        with rasterio.open(gt_path) as src:
+            y_true = src.read(1).astype(float)
+            nodata_gt = src.nodata
+        with rasterio.open(mean_path) as src:
+            y_pred = src.read(1).astype(float)
+            nodata_pred = src.nodata
+        with rasterio.open(lower_path) as src:
+            lower = src.read(1).astype(float)
+        with rasterio.open(upper_path) as src:
+            upper = src.read(1).astype(float)
+
+        if not (y_true.shape == y_pred.shape == lower.shape == upper.shape):
+            logger.error("PixelPopDiagnostics: Raster shapes do not match")
+            raise ValueError("Raster shapes do not match")
+
+        logger.info(f"PixelPopDiagnostics: Total pixels: {y_true.size}")
+
+        # 3. Lọc nodata / pixel không hợp lệ
+        mask = np.ones_like(y_true, dtype=bool)
+        if nodata_gt is not None:
+            mask &= (y_true != nodata_gt)
+        if nodata_pred is not None:
+            mask &= (y_pred != nodata_pred)
+        mask &= ~np.isnan(y_true) & ~np.isnan(y_pred) & ~np.isnan(lower) & ~np.isnan(upper)
+
+        y_true = y_true[mask]
+        y_pred = y_pred[mask]
+        lower = lower[mask]
+        upper = upper[mask]
+        n = y_true.size
+        logger.info(f"PixelPopDiagnostics: Number of valid pixels after filtering: {n}")
+
+        # 4. Các chỉ số accuracy cơ bản
+        rmsd = np.sqrt(np.mean((y_pred - y_true) ** 2))
+        percent_rmsd = 100 * rmsd / np.mean(y_true) if np.mean(y_true) != 0 else np.nan
+        mae = np.mean(np.abs(y_pred - y_true))
+        ss_res = np.sum((y_true - y_pred) ** 2)
+        ss_tot = np.sum((y_true - np.mean(y_true)) ** 2)
+        r2 = 1 - ss_res / ss_tot if ss_tot > 0 else np.nan
+
+        
+        within_pi = (y_true >= lower) & (y_true <= upper)
+        above_upper = y_true > upper
+        below_lower = y_true < lower
+
+        pct_pi_correct = float(np.mean(within_pi)) * 100
+        pct_above_upper = float(np.mean(above_upper)) * 100
+        pct_below_lower = float(np.mean(below_lower)) * 100
+        
+        metrics = {
+                    'RMSD': rmsd,
+                    'PercentRMSD': percent_rmsd,
+                    'MAE': mae,
+                    'R2': r2,
+                    'pct_pi_correct': pct_pi_correct,
+                    'pct_above_upper': pct_above_upper,
+                    'pct_below_lower': pct_below_lower,
+                    'n': n,
+                }
+
+        # Lưu các chỉ số ra csv
+        output_csv = Path(self.settings.output_dir) / "pixelpopdiag.csv"
+        pd.DataFrame([metrics]).to_csv(output_csv, index=False)
+        logger.info(f"PixelPopDiagnostics: Output saved to {output_csv}")
+        
+        logger.info(
+            f"PixelPopDiagnostics: RMSD={rmsd:.2f}, PercentRMSD={percent_rmsd:.2f}, "
+            f"MAE={mae:.2f}, R2={r2:.4f},"
+            f"PI_correct={pct_pi_correct:.2f}%, AboveUpper={pct_above_upper:.2f}%, "
+            f"BelowLower={pct_below_lower:.2f}%, n={n}"
+        )
+
+        return {**metrics, 'csv': str(output_csv)}
+    def evaluate(self):
+        logger.info("PixelPopDiagnostics: Starting evaluation...")
+
+        # 1. Input rasters
+        gt_path = self.settings.ground_truth
+        pred_path = self.settings.output_raster.get('dasymetric')
+
+        for name, p in [("ground_truth", gt_path), ("prediction", pred_path)]:
+            if not p or not Path(p).is_file():
+                logger.error(f"{name} raster not found: {p}")
+                raise FileNotFoundError(f"{name} raster not found: {p}")
+
+        # 2. Read rasters
+        logger.info("PixelPopDiagnostics: Reading rasters...")
+
+        with rasterio.open(gt_path) as src:
+            y_true = src.read(1).astype(np.float32)
+            nodata_gt = src.nodata
+
+        with rasterio.open(pred_path) as src:
+            y_pred = src.read(1).astype(np.float32)
+            nodata_pred = src.nodata
+
+        if y_true.shape != y_pred.shape:
+            logger.error("PixelPopDiagnostics: Raster shapes do not match")
+            raise ValueError("Raster shapes do not match")
+
+        logger.info(f"PixelPopDiagnostics: Total pixels: {y_true.size}")
+
+        # 3. Filter invalid pixels
+        mask = np.ones_like(y_true, dtype=bool)
+
+        if nodata_gt is not None:
+            mask &= (y_true != nodata_gt)
+
+        if nodata_pred is not None:
+            mask &= (y_pred != nodata_pred)
+
+        mask &= np.isfinite(y_true)
+        mask &= np.isfinite(y_pred)
+
+        y_true = y_true[mask]
+        y_pred = y_pred[mask]
+
+        n = len(y_true)
+
+        if n == 0:
+            raise ValueError("No valid pixels found after filtering.")
+
+        logger.info(f"PixelPopDiagnostics: Number of valid pixels: {n}")
+
+        # 4. Accuracy metrics
+        diff = y_pred - y_true
+
+        rmsd = np.sqrt(np.mean(diff ** 2))
+        mae = np.mean(np.abs(diff))
+
+        mean_true = np.mean(y_true)
+        percent_rmsd = 100 * rmsd / mean_true if mean_true != 0 else np.nan
+
+        ss_res = np.sum(diff ** 2)
+        ss_tot = np.sum((y_true - mean_true) ** 2)
+        r2 = 1 - ss_res / ss_tot if ss_tot > 0 else np.nan
+
+        metrics = {
+            "RMSD": rmsd,
+            "PercentRMSD": percent_rmsd,
+            "MAE": mae,
+            "R2": r2,
+            "n": n,
+        }
+
+        # 5. Save metrics
+        output_csv = Path(self.settings.output_dir) / "pixelpopdiag.csv"
+        pd.DataFrame([metrics]).to_csv(output_csv, index=False)
+
+        logger.info(f"PixelPopDiagnostics: Output saved to {output_csv}")
+        logger.info(
+            f"PixelPopDiagnostics: "
+            f"RMSD={rmsd:.2f}, "
+            f"PercentRMSD={percent_rmsd:.2f}, "
+            f"MAE={mae:.2f}, "
+            f"R2={r2:.4f}, "
+            f"n={n}"
+        )
+
+        return {
+            **metrics,
+            "csv": str(output_csv),
         }

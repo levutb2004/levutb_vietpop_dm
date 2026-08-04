@@ -4,7 +4,7 @@ from typing import Dict, Optional, List, Tuple, Any
 import numpy as np
 import pandas as pd
 import geopandas as gpd
-
+import rasterio
 from ..utils.logger import get_logger
 from ..utils.raster import raster_stat_stack
 from ..config.settings import Settings
@@ -180,7 +180,7 @@ class FeatureExtractor:
 
     def extract(self,
                 save: Optional[str] = None,
-                avg_only: bool = True) -> pd.DataFrame:
+                avg_only: bool = True, pixel_sample: bool = False) -> pd.DataFrame:
         """
         Extract features from raster data.
 
@@ -264,7 +264,36 @@ class FeatureExtractor:
         inf_density = np.sum(np.isinf(res['dens']))
         if inf_density > 0:
             logger.warning(f"Found {inf_density} zones with infinite density")
+        
 
+        # Append pixel-level samples if requested
+        if pixel_sample:
+            try:
+                logger.info("Extracting pixel-level samples")
+                try:
+                    res['is_commune'] = 1
+                    max_commune_id = pd.to_numeric(res['id'], errors='coerce').max()
+                    start_id = int(max_commune_id) + 1
+                except Exception:
+                    logger.warning("Could not infer numeric commune id, defaulting start_id=0")
+                    start_id = 0
+                
+                pixel_df = self._extract_pixel_samples(start_id=start_id)
+                logger.debug(f"Pixel samples extracted: {pixel_df.shape}")
+
+                # Align columns with commune-level res
+                for c in res.columns:
+                    if c not in pixel_df.columns:
+                        pixel_df[c] = np.nan
+                pixel_df = pixel_df[res.columns]
+
+                res = pd.concat([res, pixel_df], ignore_index=True)
+                logger.info(
+                    f"Appended {len(pixel_df)} pixel samples. "
+                    f"Total rows: {len(res)}"
+                )
+            except Exception as e:
+                logger.error(f"Failed to extract pixel-level samples: {str(e)}")
         # Save features
         logger.info("Saving extracted features")
         output_path = Path(self.settings.work_dir) / 'output' / 'features.csv'
@@ -289,3 +318,48 @@ class FeatureExtractor:
 
         self.features = res
         return res
+    def _extract_pixel_samples(self, start_id: int = 0) -> pd.DataFrame:
+        """
+        Extract individual pixel-level samples from a population raster that
+        contains only valid sample pixels (rest is nodata), and attach
+        covariate values at the same pixel positions.
+
+        Args:
+            start_id: id bắt đầu cho pixel samples, để nối tiếp id commune
+                hiện có (tránh trùng id).
+
+        Returns:
+            pd.DataFrame: pixel-level samples with columns
+                ['id', 'pop', 'dens', 'is_commune'] + covariate averages
+        """
+        pop_raster_path = r'F:\pomelo\vietpop_dm\prj_vn_2019\data\VNM_covariates_2019\selected_sample.tif'
+        covariate_paths = self.settings.covariate
+
+        if not pop_raster_path or not Path(pop_raster_path).is_file():
+            logger.error(f"Pixel-sample population raster not found: {pop_raster_path}")
+            raise FileNotFoundError(f"Pixel-sample population raster not found: {pop_raster_path}")
+
+        with rasterio.open(pop_raster_path) as ref:
+            pop_arr = ref.read(1, masked=True)
+
+        valid_rows, valid_cols = np.where(~pop_arr.mask)
+        n_valid = len(valid_rows)
+        logger.debug(f"Pixel-sample population raster has {n_valid} valid pixels")
+
+        pop_values = np.asarray(pop_arr)[valid_rows, valid_cols]
+
+
+        pixel_df = pd.DataFrame({
+            "id": range(start_id, start_id + n_valid),
+            "pop": pop_values,
+            "dens": pop_values
+        })
+
+        for col_name, path in covariate_paths.items():
+            with rasterio.open(path) as src:
+                arr = src.read(1)
+                pixel_df[f"{col_name}_avg"] = arr[valid_rows, valid_cols]
+
+        pixel_df["is_commune"] = 0
+
+        return pixel_df
