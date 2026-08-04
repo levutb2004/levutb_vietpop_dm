@@ -1,0 +1,25 @@
+{
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "Debug Run",
+            "type": "debugpy",
+            "request": "launch",
+            "module": "vietpop.cli.main",
+            "cwd": "${workspaceFolder}",
+            "env": {
+                "PYTHONPATH": "src"
+            },
+            "args": [
+                "run",
+                "-c",
+                "prj_vn_2019/config.yaml",
+                "--verbose",
+                "--model-type",
+                "bart"
+            ],
+            "console": "integratedTerminal",
+            "justMyCode": false
+        }
+    ]
+}

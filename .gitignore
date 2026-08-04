@@ -28,7 +28,7 @@ env/
 
 # IDE specific
 .idea/
-.vscode/
+
 *.swp
 *.swo
 
