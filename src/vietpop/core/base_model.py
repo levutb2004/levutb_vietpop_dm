@@ -401,7 +401,7 @@ class RandomForestIntervalEstimator(BaseEstimator):
         
         ro.r(
                 """
-                rm(list = intersect(c("test_x", "out", "alpha"), ls(envir = .GlobalEnv)),
+                rm(list = intersect(c("test_x", "out"), ls(envir = .GlobalEnv)),
                    envir = .GlobalEnv)
                 """
             )
