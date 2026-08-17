@@ -26,6 +26,7 @@ from pathlib import Path
 # from torch.optim.lr_scheduler import ReduceLROnPlateau
 import geopandas as gpd
 from libpysal.weights import Queen
+import gc
 
 class BaseEstimator(ABC):
     """
@@ -396,9 +397,18 @@ class RandomForestIntervalEstimator(BaseEstimator):
             )
             """
         )
-
         result_df = self._r_to_pandas(ro.r("out"))
-
+        
+        ro.r(
+                """
+                rm(list = intersect(c("test_x", "out", "alpha"), ls(envir = .GlobalEnv)),
+                   envir = .GlobalEnv)
+                """
+            )
+        del Xdf
+        gc.collect()
+        ro.r("gc(verbose = FALSE)")
+        
         if not isinstance(result_df, pd.DataFrame):
             result_df = pd.DataFrame(result_df)
 
