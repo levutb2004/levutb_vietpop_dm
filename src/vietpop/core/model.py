@@ -640,7 +640,6 @@ class Model:
                 mp_context=ctx,
                 initializer=_rfpi_worker_init,
                 initargs=(str(tmp_base), str(tmp_scaler_path), covariate_paths, mastergrid_path),
-                max_tasks_per_child=10
             ) as executor:
                 futures = [executor.submit(_rfpi_worker_process_district, t) for t in tasks]
 
