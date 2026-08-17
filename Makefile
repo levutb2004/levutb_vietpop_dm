@@ -4,16 +4,17 @@ PYTHON=python
 SCRIPT=vietpop.cli.main
 CONFIG=prj_vn_2019/config.yaml
 # MODEL=lr
-MODEL=rf
+#MODEL=rf
 #MODEL=ensemble
 #MODEL=bart
 # MODEL=mlp
 # MODEL=glm
+MODEL=rf-pi
 
 # Default target
 train:
 	@echo "Training model..."
-	set PYTHONPATH=$(PYTHONPATH) && $(PYTHON) -m $(SCRIPT) train -c $(CONFIG) --verbose --no-viz --model-type $(MODEL)
+	set PYTHONPATH=$(PYTHONPATH) && $(PYTHON) -m $(SCRIPT) train -c $(CONFIG) --verbose --model-type $(MODEL)
 
 trainmlp:
 	@echo "Training model..."
@@ -41,7 +42,7 @@ mergecommunes:
 
 spatialdiag:
 	@echo "Running spatial diagnostics..."
-	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m $(SCRIPT) spatialdiag -c $(CONFIG) -m prj_vn_2019/output/$(MODEL).pkl.gz
+	set PYTHONPATH=$(PYTHONPATH) && $(PYTHON) -m $(SCRIPT) spatialdiag -c $(CONFIG) -m prj_vn_2019/output/$(MODEL).pkl.gz
 
 mlflow:
 	@echo "Starting MLflow UI..."

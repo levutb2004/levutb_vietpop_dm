@@ -7,6 +7,7 @@ import scipy.ndimage as ndimage
 from pymc_bart.utils import _sample_posterior
 import matplotlib.pyplot as plt
 from pathlib import Path
+import gzip, cloudpickle
 import joblib
 import rasterio
 import threading
@@ -15,7 +16,7 @@ from sklearn.preprocessing import RobustScaler
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import cross_validate
 from sklearn.inspection import permutation_importance
-from .base_model import BaseEstimator, GLMEstimator, RandomForestEstimator  # thêm import
+from .base_model import BaseEstimator, GLMEstimator, RandomForestEstimator, RandomForestIntervalEstimator  # thêm import
 from rasterio.windows import Window
 import pymc as pm
 import pymc_bart as pmb
@@ -25,11 +26,93 @@ from ..utils.joblib_manager import joblib_resources
 from ..utils.logger import get_logger
 from ..utils.matplotlib_utils import with_non_interactive_matplotlib
 from ..utils.raster_processing import progress_bar
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
+import multiprocessing as mp
 from .diagnostics import ResidualDiagnostics
 
 
 logger = get_logger()
+
+
+# ============================================================================
+# RF-PI multiprocessing worker functions (module-level bắt buộc để pickle được
+# khi dùng ProcessPoolExecutor với mp_context='spawn').
+#
+# rpy2/R chỉ có MỘT R interpreter cho toàn bộ process, và interpreter đó
+# KHÔNG thread-safe -> không thể dùng ThreadPoolExecutor cho RF-PI (khác BART).
+# Multiprocessing giải quyết được vì mỗi process con tự khởi tạo R session
+# riêng (qua RandomForestIntervalEstimator.load trong _rfpi_worker_init),
+# hoàn toàn độc lập với R session của process cha.
+# ============================================================================
+
+def _rfpi_worker_init(model_base_path: str, scaler_path: str,
+                       covariate_paths: dict, mastergrid_path: str) -> None:
+    """Chạy 1 lần khi mỗi process con khởi động: tự mở R session + raster riêng."""
+    global _worker_model, _worker_scaler, _worker_src, _worker_mst
+    _worker_model = RandomForestIntervalEstimator.load(model_base_path)
+    _worker_scaler = joblib.load(scaler_path)
+    _worker_src = {k: rasterio.open(p, 'r') for k, p in covariate_paths.items()}
+    _worker_mst = rasterio.open(mastergrid_path, 'r')
+
+
+def _rfpi_worker_process_district(args) -> tuple:
+    """
+    Xử lý 1 district trong process con: tự đọc window covariate + mastergrid
+    riêng (không nhận mảng lớn từ main process), predict interval, scale theo
+    census. Trả về mảng NHỎ (chỉ kích thước bounding box) để IPC nhẹ.
+    """
+    (district_id, row_start, row_stop, col_start, col_stop,
+     names, alpha, log_scale, census_total, nodata) = args
+
+    window = Window(col_start, row_start, col_stop - col_start, row_stop - row_start)
+
+    mst_win = _worker_mst.read(1, window=window)
+    district_mask = (mst_win == district_id)
+    out_shape = mst_win.shape
+
+    df = pd.DataFrame()
+    for s in _worker_src:
+        arr = _worker_src[s].read(1, window=window)
+        df[s + '_avg'] = arr.flatten()
+    df = df[names]
+
+    valid_mask = df.notna().all(axis=1).values & district_mask.flatten()
+    n_pixels = len(df)
+    pred_arr = np.full(n_pixels, nodata, dtype='float32')
+    lower_arr = np.full(n_pixels, nodata, dtype='float32')
+    upper_arr = np.full(n_pixels, nodata, dtype='float32')
+
+    valid_idx = np.where(valid_mask)[0]
+
+    if valid_idx.size > 0:
+        X_valid = df.iloc[valid_idx]
+        sx = _worker_scaler.transform(X_valid)
+
+        out = _worker_model.predict(sx, alpha=alpha)
+        yp, ylo, yhi = out['pred'], out['lower'], out['upper']
+
+        if log_scale:
+            yp, ylo, yhi = np.exp(yp), np.exp(ylo), np.exp(yhi)
+
+        pred_arr[valid_idx] = yp
+        lower_arr[valid_idx] = ylo
+        upper_arr[valid_idx] = yhi
+
+        # --- Dasymetric: scale để tổng dự đoán khớp với census của quận/huyện ---
+        predicted_total = pred_arr[valid_idx].sum()
+        if predicted_total > 0:
+            factor = census_total / predicted_total
+        else:
+            factor = 0.0
+
+        pred_arr[valid_idx] *= factor
+        lower_arr[valid_idx] *= factor
+        upper_arr[valid_idx] *= factor
+
+    return (district_id, row_start, row_stop, col_start, col_stop,
+            pred_arr.reshape(out_shape), lower_arr.reshape(out_shape),
+            upper_arr.reshape(out_shape), district_mask)
+
 
 class Model:
     """
@@ -72,7 +155,7 @@ class Model:
               model_path: Optional[str] = None,
               scaler_path: Optional[str] = None,
               log_scale: bool = False,
-              save_model: bool = True) -> None:
+              save_model: bool = False) -> None:
         """
         Train Random Forest model for population prediction.
 
@@ -125,7 +208,7 @@ class Model:
             self.model = self._estimator
             logger.debug(f"Initialized {self.model.__class__.__name__}")
 
-            if not isinstance(self.model, GLMEstimator):
+            if not isinstance(self.model, (GLMEstimator, RandomForestIntervalEstimator)):
                 with joblib_resources():
                     logger.info("Performing feature selection")
                     importances, selected = self._select_features(X_scaled, y)
@@ -152,7 +235,18 @@ class Model:
             logger.info(f"Loading model from: {model_path}")
             with joblib_resources():
                 try:
-                    self.model = joblib.load(model_path)
+                    model_path_p = Path(model_path)
+                    is_rfpi_file = (model_path_p.suffix == '.pkl'
+                                     and not model_path_p.name.endswith('.pkl.gz'))
+                    if isinstance(self._estimator, RandomForestIntervalEstimator) or is_rfpi_file:
+                        # rpy2/R objects không pickle được qua joblib -> dùng
+                        # loader riêng của RandomForestIntervalEstimator, load
+                        # từ cặp file <base>.rds / <base>.pkl
+                        rfpi_base = str(model_path_p.with_suffix(''))
+                        logger.debug(f"Loading RF-PI model (rpy2) from base path: {rfpi_base}")
+                        self.model = RandomForestIntervalEstimator.load(rfpi_base)
+                    else:
+                        self.model = joblib.load(model_path)
                     self.selected_features = self.model.selected_features
                     logger.debug("Model loaded successfully")
                 except Exception as e:
@@ -165,103 +259,6 @@ class Model:
                 self._save_model()
 
         logger.info("Model training completed successfully")
-    def bart_train(self,
-                    data: pd.DataFrame,
-                    model_path: Optional[str] = None,
-                    scaler_path: Optional[str] = None,
-                    log_scale: bool = False,
-                    save_model: bool = True,
-                    draws: int = 250,
-                    tune: int = 1000,
-                    chains: int = 2,
-                    random_seed: int = 42) -> None:
-        """
-        Train PyMC-BART model for population density prediction.
-
-        Args:
-            data: DataFrame containing features and target variables.
-                Must include 'id', 'pop', 'dens' columns
-            model_path: Optional path to load a saved InferenceData (.nc) trace
-            scaler_path: Optional path to load fitted scaler
-            log_scale: Whether to train the model with log(dens)
-            save_model: Whether to save trace/model after training
-            draws, tune, chains: MCMC sampling parameters
-            random_seed: seed for reproducibility
-
-        Raises:
-            ValueError: If input data is invalid
-            RuntimeError: If model/trace loading fails
-        """
-        data = data.dropna()
-
-        if self._estimator.requires_admin_id and 'id' in data.columns:
-            self._estimator.set_admin_ids(data['id'].values)
-
-        drop_cols = np.intersect1d(data.columns.values, ['id', 'pop', 'dens', 'is_commune'])
-        X = data.drop(columns=drop_cols).copy()
-        y = data['dens'].values.astype(float)
-
-        if log_scale:
-            y = np.log(np.maximum(y, 0.1))
-
-        self.target_mean = y.mean()
-        self.feature_names = X.columns.values
-        logger.debug(f"Features selected: {self.feature_names.tolist()}")
-        logger.debug(f"Target mean: {self.target_mean:.4f}")
-
-        # --- Scaler (BART is scale-invariant for X, but keep for consistency/pipeline reuse) ---
-        if scaler_path is None:
-            logger.info("Creating new scaler")
-            self.scaler = RobustScaler()
-            self.scaler.fit(X)
-        else:
-            logger.info(f"Loading scaler from: {scaler_path}")
-            try:
-                self.scaler = joblib.load(scaler_path)
-            except Exception as e:
-                logger.error(f"Failed to load scaler: {str(e)}")
-                raise
-
-        X_scaled = self.scaler.transform(X)
-        self.selected_features = X.columns.values  # BART handles feature relevance internally via variable inclusion
-
-        if model_path is None:
-            logger.info("Training new BART model")
-
-            with pm.Model() as bart_model:
-                X_data = pm.Data("X_data", X_scaled)
-                y_data = pm.Data("y_data", y)
-
-                sigma = pm.HalfNormal("sigma", sigma=y.std())
-                mu = pmb.BART("mu", X_data, y_data, m=50)
-                likelihood = pm.Normal("y_obs", mu=mu, sigma=sigma, observed=y_data)
-
-                logger.info("Sampling started")
-                idata = pm.sample(
-                    draws=draws,
-                    tune=tune,
-                    chains=chains,
-                    random_seed=random_seed,
-                    return_inferencedata=True,
-                )
-
-            self.model = bart_model
-            self.trace = idata
-            logger.debug("BART sampling completed")
-
-        else:
-            logger.info(f"Loading trace from: {model_path}")
-            try:
-                self.trace = az.from_netcdf(model_path)
-            except Exception as e:
-                logger.error(f"Failed to load trace: {str(e)}")
-                raise
-
-        if save_model:
-            logger.info("Saving trace and scaler")
-            self._save_bart_model()
-
-        logger.info("BART training completed successfully")
     def _select_features(self,
                          X: np.ndarray,
                          y: np.ndarray,
@@ -504,6 +501,194 @@ class Model:
         logger.info("Prediction completed successfully")
         return str(outfile)
     @with_non_interactive_matplotlib
+    def predict_grid_interval(self,
+                        log_scale: bool = False,
+                        alpha: float = 0.05,
+                        max_workers: Optional[int] = None) -> dict:
+        """
+        Dự đoán RF (point + prediction interval) theo từng quận/huyện
+        (dựa trên mastergrid) và scale kết quả để tổng dân số dự đoán
+        trong mỗi quận/huyện khớp với census — dùng RandomForestIntervalEstimator
+        (ranger + forestError).
+
+        Chạy bằng multiprocessing THẬT SỰ (ProcessPoolExecutor, mp_context=
+        'spawn'), KHÔNG dùng ThreadPoolExecutor: rpy2/R chỉ có 1 R interpreter
+        cho toàn process và không thread-safe, nên nhiều thread gọi predict()
+        cùng lúc sẽ đụng độ R globalenv. Mỗi process con tự khởi tạo R session
+        + tự đọc raster của riêng nó (chỉ giữ dữ liệu 1 district tại một thời
+        điểm) -> phù hợp cả với dataset rất nặng.
+
+        Args:
+            log_scale: Nếu True, exp() kết quả trước khi scale theo census.
+            alpha: Mức ý nghĩa cho prediction interval (mặc định 0.05).
+            max_workers: Số process song song. Mặc định lấy từ
+                         self.settings.max_workers. Mỗi worker tốn RAM cho
+                         1 R session + model -> đừng đặt quá cao so với RAM.
+
+        Returns:
+            dict: {'pred': path, 'lower': path, 'upper': path}
+
+        Raises:
+            RuntimeError: If model is not trained, or estimator has no predict()
+        """
+        logger.info("Starting RF prediction-interval generation (multiprocessing, district-level dasymetric)")
+
+        if self.model is None or self.scaler is None:
+            logger.error("Model not trained. Call train() first")
+            raise RuntimeError("Model not trained. Call train() first.")
+        if not hasattr(self.model, 'predict'):
+            raise RuntimeError(
+                "Loaded estimator does not support predict(). "
+                "Train with --model-type rf-pi (or --predict-interval)."
+            )
+        if not isinstance(self.model, RandomForestIntervalEstimator):
+            raise RuntimeError(
+                "predict_grid_interval() chỉ hỗ trợ RandomForestIntervalEstimator "
+                f"(rpy2/ranger/forestError), nhận được: {type(self.model)}"
+            )
+
+        max_workers = max_workers or self.settings.max_workers
+
+        id_col = self.settings.district_census['id_column']
+        pop_col = self.settings.district_census['pop_column']
+
+        # --- Load census: dict {district_id: population} ---
+        census_source = self.settings.district_census['path']
+        census_df = pd.read_csv(census_source)
+        census = dict(zip(census_df[id_col], census_df[pop_col]))
+
+        # --- Dump model + scaler ra đĩa để mỗi process con tự load lại ---
+        # (rpy2 R objects và closures không pickle được qua process boundary,
+        # nên KHÔNG thể truyền self.model trực tiếp cho worker)
+        tmp_base = self.output_dir / f'_{self.model_type}_mp_worker'
+        tmp_scaler_path = self.output_dir / f'_{self.model_type}_mp_worker_scaler.pkl.gz'
+        logger.debug(f"Dumping model/scaler cho worker tại: {tmp_base}.* / {tmp_scaler_path}")
+        self.model.selected_features = self.selected_features
+        self.model.save(str(tmp_base))
+        joblib.dump(self.scaler, tmp_scaler_path)
+
+        covariate_paths = dict(self.settings.covariate)
+        mastergrid_path = self.settings.district_mastergrid
+
+        mst = None
+        dst_handles = {}
+        try:
+            logger.debug("Opening mastergrid (main process, chỉ để tính bounding box)")
+            mst = rasterio.open(mastergrid_path, 'r')
+            mst_arr = mst.read(1)
+
+            profile = mst.profile.copy()
+            profile.update({'dtype': 'float32'})
+
+            names = self.selected_features
+            base_outfile = Path(self.settings.output_raster['prediction'])
+            outfiles = {
+                'pred': base_outfile.with_name(base_outfile.stem + '_pred.tif'),
+                'lower': base_outfile.with_name(base_outfile.stem + '_lower.tif'),
+                'upper': base_outfile.with_name(base_outfile.stem + '_upper.tif'),
+            }
+            dst_handles = {key: rasterio.open(path, 'w+', **profile) for key, path in outfiles.items()}
+            logger.info(f"Output will be saved to: {outfiles}")
+
+            nodata = profile.get('nodata', -9999.0)
+
+            # --- Ghi nodata cho toàn bộ raster trước, sau đó ghi đè theo từng quận ---
+            init_arr = np.full((mst.height, mst.width), nodata, dtype='float32')
+            for handle in dst_handles.values():
+                handle.write(init_arr, indexes=1)
+            del init_arr
+
+            # --- Bounding box mỗi district bằng scipy.ndimage.find_objects ---
+            max_label = int(np.nanmax(mst_arr))
+            objects = ndimage.find_objects(mst_arr.astype(np.int32), max_label=max_label)
+            del mst_arr  # không cần giữ toàn bộ mastergrid trong RAM main process nữa
+            mst.close()
+            mst = None
+
+            district_ids = [d for d in census.keys()
+                            if 0 < d <= max_label and objects[int(d) - 1] is not None]
+            logger.info(f"Processing {len(district_ids)} districts (of {len(census)} in census table) "
+                        f"across {max_workers} worker process(es)")
+
+            # --- Build task args (nhẹ: chỉ toạ độ + metadata, KHÔNG kèm mảng lớn) ---
+            tasks = []
+            for district_id in district_ids:
+                row_slice, col_slice = objects[int(district_id) - 1]
+                tasks.append((
+                    district_id,
+                    row_slice.start, row_slice.stop,
+                    col_slice.start, col_slice.stop,
+                    names, alpha, log_scale,
+                    census[district_id], nodata,
+                ))
+
+            progress = {'done': 0, 'total': len(tasks)}
+
+            # --- spawn (không fork): R embedded interpreter không an toàn khi
+            #     fork một process cha đã có R session đang chạy ---
+            ctx = mp.get_context('spawn')
+            with ProcessPoolExecutor(
+                max_workers=max_workers,
+                mp_context=ctx,
+                initializer=_rfpi_worker_init,
+                initargs=(str(tmp_base), str(tmp_scaler_path), covariate_paths, mastergrid_path),
+            ) as executor:
+                futures = [executor.submit(_rfpi_worker_process_district, t) for t in tasks]
+
+                for fut in progress_bar(as_completed(futures), self.settings.show_progress,
+                                         len(futures), desc="RF Dasymetric Prediction Interval"):
+                    (district_id, row_start, row_stop, col_start, col_stop,
+                     pred_win, lower_win, upper_win, district_mask) = fut.result()
+
+                    window = Window(col_start, row_start, col_stop - col_start, row_stop - row_start)
+
+                    # --- Ghi kết quả tuần tự ở main process: read-modify-write
+                    #     vì bbox các quận có thể chồng nhau, và tránh nhiều
+                    #     process cùng ghi vào 1 file .tif ---
+                    existing_pred = dst_handles['pred'].read(1, window=window)
+                    new_pred = np.where(district_mask, pred_win, existing_pred)
+                    dst_handles['pred'].write(new_pred, window=window, indexes=1)
+
+                    existing_lower = dst_handles['lower'].read(1, window=window)
+                    new_lower = np.where(district_mask, lower_win, existing_lower)
+                    dst_handles['lower'].write(new_lower, window=window, indexes=1)
+
+                    existing_upper = dst_handles['upper'].read(1, window=window)
+                    new_upper = np.where(district_mask, upper_win, existing_upper)
+                    dst_handles['upper'].write(new_upper, window=window, indexes=1)
+
+                    progress['done'] += 1
+                    if progress['done'] % 10 == 0 or progress['done'] == progress['total']:
+                        logger.info(f"District progress: {progress['done']}/{progress['total']} "
+                                    f"({100*progress['done']/progress['total']:.1f}%)")
+
+        except Exception as e:
+            logger.error(f"Error during dasymetric prediction interval: {str(e)}")
+            import traceback
+            logger.error(f"Full traceback: {traceback.format_exc()}")
+            raise
+        finally:
+            if mst is not None:
+                try:
+                    mst.close()
+                except Exception as e:
+                    logger.warning(f"Error closing mastergrid: {str(e)}")
+            for handle in dst_handles.values():
+                try:
+                    handle.close()
+                except Exception as e:
+                    logger.warning(f"Error closing output raster: {str(e)}")
+            # --- Dọn file tạm dùng để truyền model/scaler cho worker ---
+            for p in (tmp_base.with_suffix('.rds'), tmp_base.with_suffix('.pkl'), tmp_scaler_path):
+                try:
+                    if p.exists():
+                        p.unlink()
+                except Exception as e:
+                    logger.warning(f"Error removing temp worker file {p}: {str(e)}")
+
+        logger.info("RF dasymetric prediction interval (multiprocessing) completed successfully")
+        return {k: str(v) for k, v in outfiles.items()}
+    @with_non_interactive_matplotlib
     def predict_bart_grid(self, log_scale: bool = False) -> dict:
         """ Dự đoán BART theo từng quận/huyện (dựa trên mastergrid) và scale
         kết quả để tổng dân số dự đoán trong mỗi quận/huyện khớp với census.
@@ -698,7 +883,6 @@ class Model:
         logger.info("Starting admin prediction and residual computation")
 
         # Drop NA rows
-        data = data.dropna()
         logger.debug(f"Data shape after dropna: {data.shape}")
 
         # Pass admin IDs to model before dropping id column
@@ -738,16 +922,77 @@ class Model:
 
 
         return dens_pred
+    def predict_bart_admin(self,
+                            data: pd.DataFrame,
+                            model_path: Optional[str] = None,
+                            log_scale: bool = False) -> np.ndarray:
+        """
+        Load a saved BART model (if not already loaded) and predict
+        population density for admin units.
 
+        Args:
+            data: DataFrame containing features (and optionally id column)
+            model_path: Optional path override; if given, forces a reload
+            log_scale: Whether the model was trained on log(dens)
+
+        Returns:
+            Predicted density array (back-transformed if log_scale=True)
+        """
+        logger.info("Starting BART admin prediction")
+
+        if self._estimator.requires_admin_id and 'id' in data.columns:
+            self._estimator.set_admin_ids(data['id'].values)
+
+        # Prepare features and target
+        drop_cols = np.intersect1d(data.columns.values, ['id', 'pop', 'dens', 'is_commune'])
+        X = data.drop(columns=drop_cols).copy()
+        y = data['dens'].values
+        logger.debug(f"Feature columns: {X.columns.values.tolist()}")
+
+        # Log scale if needed
+        if log_scale:
+            y = np.log(np.maximum(y, 0.1))
+            logger.info("Applied log scaling to target")
+
+        # Use selected features from model
+        if self.selected_features is not None:
+            X = X[self.selected_features]
+            logger.debug(f"Using selected features: {self.selected_features.tolist()}")
+
+        # Scale features
+        sx = self.scaler.transform(X)
+        logger.info("Features scaled for prediction")
+        model = self.model
+        with model:
+            samples = _sample_posterior(
+                all_trees=model.mu.owner.op.all_trees,
+                X=sx,
+                rng=np.random.default_rng(42),
+                size=100
+            )
+        samples = samples.squeeze(-1)
+        y_pred = samples.mean(axis=0)
+        dens_pred = np.exp(y_pred) if log_scale else y_pred
+        logger.info(f"Predicted density: mean={dens_pred.mean():.4f}, std={dens_pred.std():.4f}")
+
+        return dens_pred
     def _save_model(self) -> None:
         """Save model and scaler to disk."""
-        model_path = self.output_dir / f'{self.model_type}.pkl.gz'
         scaler_path = self.output_dir / f'{self.model_type}_scaler.pkl.gz'
 
         try:
             self.model.selected_features = self.selected_features
-            joblib.dump(self.model, model_path)
-            logger.debug(f"Model saved to: {model_path}")
+
+            if isinstance(self.model, RandomForestIntervalEstimator):
+                # rpy2/R objects (rf, train_nodes...) không pickle được qua
+                # joblib -> dùng save() riêng của estimator (.rds + .pkl)
+                rfpi_base = self.output_dir / self.model_type
+                self.model.save(str(rfpi_base))
+                logger.debug(f"RF-PI model saved to: {rfpi_base}.rds / {rfpi_base}.pkl")
+            else:
+                model_path = self.output_dir / f'{self.model_type}.pkl.gz'
+                joblib.dump(self.model, model_path)
+                logger.debug(f"Model saved to: {model_path}")
 
             joblib.dump(self.scaler, scaler_path)
             logger.debug(f"Scaler saved to: {scaler_path}")
@@ -756,18 +1001,30 @@ class Model:
         except Exception as e:
             logger.error(f"Failed to save model or scaler: {str(e)}")
             raise
-    def _save_bart_model(self):
-        output_dir = Path(self.settings.work_dir) / 'output'
-        output_dir.mkdir(exist_ok=True)
-        #model_path = self.output_dir / f'{self.model_type}.pkl.gz'
-        #joblib.dump(self.model, model_path)
-        #logger.debug(f"Model saved to: {model_path}")
-        trace_path = output_dir / f'{self.model_type}.nc'
-        az.to_netcdf(self.trace, trace_path)
-        logger.info(f"Trace saved to: {trace_path}")
-        scaler_path = output_dir / f'{self.model_type}_scaler.pkl.gz'
-        joblib.dump(self.scaler, scaler_path)
-        logger.info(f"Scaler saved to: {scaler_path}")
+    def _save_bart_model(self) -> None:
+        """Save BART model (incl. trace/trees), scaler, and metadata to disk in one file."""
+        model_path = self.output_dir / f'{self.model_type}.pkl.gz'
+
+
+        try:
+            self.model.feature_names = self.feature_names
+            self.model.selected_features = self.selected_features
+
+            with gzip.open(model_path, 'wb') as f:
+                cloudpickle.dump({
+                    'model': self.model,
+                    'trace': self.trace,
+                    'scaler': self.scaler,
+                    'feature_names': self.feature_names,
+                    'selected_features': self.selected_features,
+                    'target_mean': self.target_mean,
+                }, f)
+
+            logger.debug(f"Model saved to: {model_path}")
+            logger.info("BART model, trace and scaler saved successfully")
+        except Exception as e:
+            logger.error(f"Failed to save BART model/trace/scaler: {str(e)}")
+            raise
     def load_model(self,
                    model_path: str = None,
                    scaler_path: str = None) -> None:
@@ -787,7 +1044,14 @@ class Model:
                 scaler_path = self.output_dir / f'{self.model_type}_scaler.pkl.gz'
 
             logger.debug(f"Loading model from: {model_path}")
-            self.model = joblib.load(model_path)
+            model_path_p = Path(model_path)
+            is_rfpi_file = (model_path_p.suffix == '.pkl'
+                             and not model_path_p.name.endswith('.pkl.gz'))
+            if isinstance(self._estimator, RandomForestIntervalEstimator) or is_rfpi_file:
+                rfpi_base = str(model_path_p.with_suffix(''))
+                self.model = RandomForestIntervalEstimator.load(rfpi_base)
+            else:
+                self.model = joblib.load(model_path)
             self.selected_features = self.model.selected_features
             logger.debug(f"Selected features loaded from model: {self.selected_features}")
 
@@ -801,7 +1065,22 @@ class Model:
         except Exception as e:
             logger.error(f"Failed to load model or scaler: {str(e)}")
             raise
-
+    def _load_bart_model(self, model_path: Optional[str] = None) -> None:
+        try:
+            if model_path is None:
+                model_path = self.output_dir / f'{self.model_type}.pkl.gz'
+            with gzip.open(model_path, 'rb') as f:
+                obj = cloudpickle.load(f)
+            self.model = obj['model']
+            self.trace = obj['trace']
+            self.scaler = obj['scaler']
+            self.feature_names = obj['feature_names']
+            self.selected_features = obj['selected_features']
+            self.target_mean = obj['target_mean']
+            logger.info(f"BART model, trace and scaler loaded from: {path}")
+        except Exception as e:
+            logger.error(f"Failed to load BART model/trace/scaler: {str(e)}")
+            raise
     def compute_residuals(self,
                           data: pd.DataFrame,
                           log_scale: bool = False) -> ResidualDiagnostics:

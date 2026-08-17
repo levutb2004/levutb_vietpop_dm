@@ -25,7 +25,8 @@ from ..core.base_model import \
     GLMEstimator, \
     RandomForestEstimator, \
     NeuralNetEstimator, \
-    BARTEstimator#, PyTorchEstimator
+    BARTEstimator, \
+    RandomForestIntervalEstimator#, PyTorchEstimator
 from ..utils.mlflow_tracker import (
     log_diagnostics, setup_mlflow, start_run,
     log_settings, log_estimator_params,
@@ -38,6 +39,7 @@ logger = get_logger()
 
 ESTIMATOR_MAP = {
     'rf':      RandomForestEstimator,
+    'rf-pi':   RandomForestIntervalEstimator,
     'mlp':     NeuralNetEstimator,
     'lr':      LinearRegressionEstimator,
     'ensemble': EnsembleEstimator,
@@ -235,21 +237,8 @@ def train(config_file: str,
         else:
             logger.info("Starting feature extraction...")
             features = feature_extractor.extract()
-        if model_type == 'bart':
-            logger.info("Training with PyMC-BART estimator")
-            model.bart_train(
-                data=features,
-                model_path=getattr(settings, 'bart_model_path', None),
-                scaler_path=getattr(settings, 'bart_scaler_path', None),
-                log_scale=settings.log_scale,
-                save_model=True,
-                draws=getattr(settings, 'draws', 250),
-                tune=getattr(settings, 'tune', 500),
-                chains=getattr(settings, 'chains', 2),
-                random_seed=getattr(settings, 'random_seed', 42),
-            )
-        else:
-            model.train(features, log_scale=settings.log_scale)
+
+        model.train(features, log_scale=settings.log_scale)
 
         # Log sau train
         log_training_metrics(model)
@@ -470,15 +459,15 @@ def run(config_file: str,
             features = pd.read_pickle(pickle_path)
         else:
             logger.info("Starting feature extraction...")
-            features = feature_extractor.extract(pixel_sample=False)
-        if model_type == 'bart':
-            model.bart_train(features, log_scale=settings.log_scale)
-        else:
-            model.train(features, log_scale=settings.log_scale)
+            features = feature_extractor.extract(pixel_sample=True)
+            
+        model.train(features, log_scale=settings.log_scale)
 
     logger.info("Making predictions...")
     if model_type == 'bart': 
         predictions = model.predict_bart_grid(log_scale=settings.log_scale)
+    elif model_type == 'rf-pi':
+        predictions = model.predict_grid_interval(log_scale=settings.log_scale)
     else:
         predictions = model.predict_grid(log_scale=settings.log_scale)
 
@@ -590,21 +579,26 @@ def spatialdiag(config_file: str,
             features = pd.read_pickle(pickle_path)
         else:
             logger.info("features.pkl not found, running feature extraction...")
-            features = feature_extractor.extract()
+            features = feature_extractor.extract(pixel_sample=False)
+        if model_type != 'bart':
+            # --- Load pre-trained model ---
+            logger.info(f"Loading pre-trained model from: {model_path}")
+            features_dummy = feature_extractor.get_dummy()
+            model = Model(settings)
+            model.train(features_dummy,
+                        model_path=model_path,
+                        scaler_path=model_path.replace('.pkl.gz', '_scaler.pkl.gz'),
+                        log_scale=settings.log_scale,
+                        save_model=False)
+                    # --- Compute residuals ---
+            logger.info("Computing residuals...")
+            dens_pred = model.predict_admin(features, log_scale=settings.log_scale)
+        else: 
+            model = Model(settings)
+            model.bart_train(features, log_scale=settings.log_scale)
+            features = features[features["is_commune"] == 1].copy()
+            dens_pred = model.predict_bart_admin(features, log_scale=settings.log_scale)
 
-        # --- Load pre-trained model ---
-        logger.info(f"Loading pre-trained model from: {model_path}")
-        features_dummy = feature_extractor.get_dummy()
-        model = Model(settings)
-        model.train(features_dummy,
-                    model_path=model_path,
-                    scaler_path=model_path.replace('.pkl.gz', '_scaler.pkl.gz'),
-                    log_scale=settings.log_scale,
-                    save_model=False)
-
-        # --- Compute residuals ---
-        logger.info("Computing residuals...")
-        dens_pred = model.predict_admin(features, log_scale=settings.log_scale)
 
         shapefile_path = (
             settings.admin_grid['shapefile']
@@ -612,7 +606,6 @@ def spatialdiag(config_file: str,
             else settings.admin
         )
         gdf = gpd.read_file(shapefile_path)
-
         # Khởi tạo ResidualDiagnostics với dữ liệu gốc
         results = ResidualDiagnostics(
             data=features,

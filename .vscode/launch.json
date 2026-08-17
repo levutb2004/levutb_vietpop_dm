@@ -16,7 +16,7 @@
                 "prj_vn_2019/config.yaml",
                 "--verbose",
                 "--model-type",
-                "bart"
+                "rf-pi"
             ],
             "console": "integratedTerminal",
             "justMyCode": false

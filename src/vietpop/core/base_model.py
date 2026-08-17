@@ -12,6 +12,13 @@ from xgboost import XGBRegressor
 from lightgbm import LGBMRegressor
 import pymc as pm
 import pymc_bart as pmb
+import rpy2.robjects as ro
+from rpy2.robjects.packages import importr
+from rpy2.robjects import pandas2ri
+from rpy2.robjects.conversion import localconverter
+from rpy2.robjects import default_converter
+import pickle
+from pathlib import Path
 # import torch
 # import torch.nn as nn
 # from skorch import NeuralNetRegressor
@@ -73,6 +80,350 @@ class RandomForestEstimator(BaseEstimator):
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         return self._model.predict(X)
+
+    @property
+    def selected_features(self):
+        return self._selected_features
+
+    @selected_features.setter
+    def selected_features(self, value):
+        self._selected_features = value
+class RandomForestIntervalEstimator(BaseEstimator):
+
+    def __init__(
+        self,
+        num_trees: int = 200,
+        alpha: float = 0.05,
+        random_state: int = 0,
+        **ranger_kwargs,
+    ):
+        self.num_trees = num_trees
+        self.alpha = alpha
+        self.random_state = random_state
+        self.ranger_kwargs = ranger_kwargs
+
+        self._selected_features = None
+        self._train_x_df = None
+        self._train_y = None
+        self._ro = None
+        self._rf = None
+        self._r_ready = False
+        self._train_nodes = None
+    def _init_r(self):
+        if self._r_ready:
+            return
+
+        self._ro = ro
+        self._ranger = importr("ranger")
+        self._forest_error = importr("forestError")
+        import rpy2.rinterface_lib.callbacks as rcb
+        rcb.consolewrite_print = lambda s: None      # chặn stdout (cat/print/progress bar)
+        self._r_ready = True
+
+    @staticmethod
+    def _pandas_to_r(df: pd.DataFrame):
+        with localconverter(default_converter + pandas2ri.converter):
+            return ro.conversion.py2rpy(df)
+
+    @staticmethod
+    def _r_to_pandas(obj):
+        with localconverter(default_converter + pandas2ri.converter):
+            return ro.conversion.rpy2py(obj)
+    def save(self, path: str) -> None:
+        """
+        Lưu model xuống 2 file:
+        - <path>.rds    : R-side state (rf, train_x, train_y, train_nodes)
+        - <path>.pkl     : Python-side config (num_trees, alpha, seed,
+                            ranger_kwargs, selected_features, scaler nếu có)
+
+        Bắt buộc gọi sau khi fit() đã chạy thành công (self._rf không None).
+
+        Args:
+            path: đường dẫn không kèm đuôi, ví dụ "models/rf_pi_v1"
+                -> sẽ tạo "models/rf_pi_v1.rds" và "models/rf_pi_v1.pkl"
+        """
+        self._init_r()
+
+        if self._rf is None or self._train_x_df is None or self._train_nodes is None:
+            raise RuntimeError("Model chưa được fit. Gọi fit() trước khi save().")
+
+        path = Path(path)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        rds_path = path.with_suffix(".rds")
+        pkl_path = path.with_suffix(".pkl")
+
+        # --- R-side: gộp toàn bộ object cần cho predict() vào 1 list, saveRDS ---
+        # Đảm bảo globalenv đang trỏ đúng object của INSTANCE này trước khi save
+        ro.globalenv["rf"] = self._rf
+        ro.globalenv["train_x"] = self._pandas_to_r(self._train_x_df)
+        ro.globalenv["train_y"] = ro.FloatVector(self._train_y.tolist())
+        ro.globalenv["train_nodes"] = self._train_nodes
+        ro.globalenv["save_path"] = str(rds_path)
+
+        ro.r(
+            """
+            saveRDS(
+                list(rf = rf, train_x = train_x, train_y = train_y, train_nodes = train_nodes),
+                file = save_path
+            )
+            """
+        )
+
+        # --- Python-side: config cần để reconstruct đúng hành vi predict() ---
+        py_state = {
+            "num_trees": self.num_trees,
+            "random_state": self.random_state,
+            "alpha": self.alpha,
+            "ranger_kwargs": self.ranger_kwargs,
+            "selected_features": self._selected_features,
+            "train_columns": list(self._train_x_df.columns),
+            "scaler": getattr(self, "scaler", None),  # nếu class có scaler riêng
+        }
+        with open(pkl_path, "wb") as f:
+            pickle.dump(py_state, f)
+
+
+    @classmethod
+    def load(cls, path: str) -> "RandomForestIntervalEstimator":
+        """
+        Load lại model từ file đã save() — tạo R session MỚI trong process
+        hiện tại (dùng trong worker của ProcessPoolExecutor).
+
+        Args:
+            path: cùng đường dẫn (không đuôi) đã truyền cho save()
+
+        Returns:
+            RandomForestIntervalEstimator đã sẵn sàng gọi predict()
+        """
+        path = Path(path)
+        rds_path = path.with_suffix(".rds")
+        pkl_path = path.with_suffix(".pkl")
+
+        if not rds_path.exists():
+            raise FileNotFoundError(f"Không tìm thấy R state: {rds_path}")
+        if not pkl_path.exists():
+            raise FileNotFoundError(f"Không tìm thấy Python config: {pkl_path}")
+
+        with open(pkl_path, "rb") as f:
+            py_state = pickle.load(f)
+
+        instance = cls(
+            num_trees=py_state["num_trees"],
+            random_state=py_state["random_state"],
+            alpha=py_state["alpha"],
+            ranger_kwargs=py_state["ranger_kwargs"],
+            selected_features=py_state["selected_features"],
+        )
+        instance._init_r()
+
+        # --- Load lại R-side state vào globalenv của process này ---
+        ro.globalenv["load_path"] = str(rds_path)
+        ro.r('loaded <- readRDS(load_path)')
+
+        instance._rf = ro.r('loaded$rf')
+        instance._train_nodes = ro.r('loaded$train_nodes')
+
+        # --- Reconstruct train_x_df / train_y ở Python side (để predict() dùng lại) ---
+        train_x_r = ro.r('loaded$train_x')
+        instance._train_x_df = instance._r_to_pandas(train_x_r)
+        if not isinstance(instance._train_x_df, pd.DataFrame):
+            instance._train_x_df = pd.DataFrame(
+                instance._train_x_df, columns=py_state["train_columns"]
+            )
+        instance._train_x_df.columns = py_state["train_columns"]
+
+        train_y_r = ro.r('loaded$train_y')
+        instance._train_y = np.asarray(train_y_r, dtype=np.float64)
+
+        # --- Đảm bảo globalenv có sẵn train_x / train_y / train_nodes / rf
+        #     cho predict() dùng ngay (predict() hiện tại đang tham chiếu tới
+        #     các biến global này trong lệnh R) ---
+        ro.globalenv["rf"] = instance._rf
+        ro.globalenv["train_x"] = train_x_r
+        ro.globalenv["train_y"] = train_y_r
+        ro.globalenv["train_nodes"] = instance._train_nodes
+        ro.globalenv["alpha"] = instance.alpha
+
+        if py_state.get("scaler") is not None:
+            instance.scaler = py_state["scaler"]
+
+        return instance
+    def fit(
+        self,
+        X: np.ndarray,
+        y: np.ndarray,
+    ) -> "RandomForestIntervalEstimator":
+
+        self._init_r()
+
+        X = np.asarray(X, dtype=np.float64)
+        y = np.asarray(y, dtype=np.float64).ravel()
+        self._train_y = y.copy()
+
+        if X.ndim != 2:
+            raise ValueError(f"X must be 2-dimensional, got shape {X.shape}")
+
+        if len(X) != len(y):
+            raise ValueError(
+                f"X and y have different lengths: {len(X)} vs {len(y)}"
+            )
+
+        if not np.isfinite(X).all():
+            raise ValueError("X contains NaN or infinite values.")
+
+        if not np.isfinite(y).all():
+            raise ValueError("y contains NaN or infinite values.")
+
+        if self._selected_features is not None:
+            if len(self._selected_features) != X.shape[1]:
+                raise ValueError(
+                    "Number of selected_features does not match "
+                    f"X.shape[1]: {len(self._selected_features)} vs {X.shape[1]}"
+                )
+            cols = list(self._selected_features)
+        else:
+            cols = [f"f{i}" for i in range(X.shape[1])]
+
+        cols = [str(c) for c in cols]
+
+        if len(set(cols)) != len(cols):
+            raise ValueError(f"Feature names must be unique: {cols}")
+
+        Xdf = pd.DataFrame(X, columns=cols).reset_index(drop=True)
+        self._train_x_df = Xdf
+
+        ro.globalenv["train_x"] = self._pandas_to_r(Xdf)
+        ro.globalenv["train_y"] = ro.FloatVector(y.tolist())
+        ro.globalenv["num_trees"] = int(self.num_trees)
+        ro.globalenv["seed"] = int(self.random_state)
+        ro.globalenv["alpha"] = self.alpha
+        ranger_kwargs_r = ""
+
+        for key, value in self.ranger_kwargs.items():
+            if isinstance(value, bool):
+                value_r = "TRUE" if value else "FALSE"
+            elif isinstance(value, (int, np.integer)):
+                value_r = str(int(value))
+            elif isinstance(value, (float, np.floating)):
+                value_r = str(float(value))
+            elif isinstance(value, str):
+                value_r = '"' + value.replace('"', '\\"') + '"'
+            else:
+                raise TypeError(
+                    f"Unsupported ranger_kwargs type for {key}: {type(value)}"
+                )
+
+            ranger_kwargs_r += f", {key} = {value_r}"
+
+        ro.r(
+            f"""
+            train_data <- cbind(
+                train_x,
+                .target. = train_y
+            )
+            rf <- ranger(
+                .target. ~ .,
+                data = train_data,
+                num.trees = num_trees,
+                keep.inbag = TRUE,
+                seed = seed
+                {ranger_kwargs_r}
+            )
+            """
+        )
+
+        self._rf = ro.globalenv["rf"]
+        ro.r(
+            """
+            train_nodes <- forestError::findOOBErrors(
+                rf, X.train = train_x, Y.train = train_y
+            )
+            """
+        )
+        self._train_nodes = ro.globalenv["train_nodes"]
+        return self
+
+    def predict(
+        self,
+        X: np.ndarray,
+        alpha: float = None,
+    ) -> dict:
+
+        self._init_r()
+
+        if self._train_x_df is None or self._rf is None:
+            raise RuntimeError("Model has not been fitted yet.")
+
+        alpha = self.alpha if alpha is None else float(alpha)
+
+        if not 0 < alpha < 1:
+            raise ValueError(f"alpha must be between 0 and 1, got {alpha}")
+
+        X = np.asarray(X, dtype=np.float64)
+
+        if X.ndim != 2:
+            raise ValueError(f"X must be 2-dimensional, got shape {X.shape}")
+
+        if X.shape[1] != self._train_x_df.shape[1]:
+            raise ValueError(
+                "Number of features does not match training data: "
+                f"{X.shape[1]} vs {self._train_x_df.shape[1]}"
+            )
+
+        if not np.isfinite(X).all():
+            raise ValueError("X contains NaN or infinite values.")
+
+        Xdf = pd.DataFrame(
+            X,
+            columns=list(self._train_x_df.columns),
+        ).reset_index(drop=True)
+        if self._train_nodes is None:
+            raise RuntimeError("train_nodes chưa có -- model chưa được fit đúng cách.")
+        # Gắn tường minh forest + train data của CHÍNH instance này vào R globalenv,
+        # không phụ thuộc trạng thái global còn sót lại từ fit() của instance khác.
+        ro.globalenv["test_x"] = self._pandas_to_r(Xdf)
+
+        ro.r(
+            """
+            out <- forestError::quantForestError(
+                rf,
+                X.train = train_x,
+                Y.train = train_y,
+                X.test = test_x,
+                what = c("interval"),
+                alpha = alpha,
+                train_nodes = train_nodes
+            )
+            """
+        )
+
+        result_df = self._r_to_pandas(ro.r("out"))
+
+        if not isinstance(result_df, pd.DataFrame):
+            result_df = pd.DataFrame(result_df)
+
+        columns = list(result_df.columns)
+
+        pred_candidates = [
+            c for c in columns
+            if str(c).lower() in ("pred", "prediction", "estimate")
+        ]
+        if not pred_candidates:
+            raise RuntimeError(f"Could not find prediction column. Columns: {columns}")
+
+        lower_candidates = [c for c in columns if str(c).lower().startswith("lower")]
+        if not lower_candidates:
+            raise RuntimeError(f"Could not find lower interval column. Columns: {columns}")
+
+        upper_candidates = [c for c in columns if str(c).lower().startswith("upper")]
+        if not upper_candidates:
+            raise RuntimeError(f"Could not find upper interval column. Columns: {columns}")
+
+        return {
+            "pred": np.asarray(result_df[pred_candidates[0]], dtype=np.float64),
+            "lower": np.asarray(result_df[lower_candidates[0]], dtype=np.float64),
+            "upper": np.asarray(result_df[upper_candidates[0]], dtype=np.float64),
+        }
 
     @property
     def selected_features(self):
@@ -382,12 +733,27 @@ class BARTEstimator(BaseEstimator):
         self.random_state = random_state
         self._selected_features = None
 
-    def fit(self, X: np.ndarray, y: np.ndarray) -> 'BARTEstimator':
-        raise NotImplementedError(
-            "BARTEstimator.fit() không được dùng trực tiếp. "
-            "Việc train BART được thực hiện trong Model.bart_train() "
-            "thông qua pmb.BART()."
-        )
+    def fit(self, X: np.ndarray, y: np.ndarray, 
+            draws: int = 250, tune: int = 1000,chains: int = 2, random_seed: int = 42) -> 'BARTEstimator':
+        with pm.Model() as bart_model:
+            X_data = pm.Data("X_data", X)
+            y_data = pm.Data("y_data", y)
+
+            sigma = pm.HalfNormal("sigma", sigma=y.std())
+            mu = pmb.BART("mu", X_data, y_data, m=50)
+            likelihood = pm.Normal("y_obs", mu=mu, sigma=sigma, observed=y_data)
+
+            idata = pm.sample(
+                draws=draws,
+                tune=tune,
+                chains=chains,
+                random_seed=random_seed,
+                return_inferencedata=True,
+            )
+
+            self.model = bart_model
+            self.trace = idata
+        return self
 
     def predict(self, X: np.ndarray) -> np.ndarray:
         raise NotImplementedError(
