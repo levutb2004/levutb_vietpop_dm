@@ -29,6 +29,7 @@ from ..utils.raster_processing import progress_bar
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import multiprocessing as mp
 from .diagnostics import ResidualDiagnostics
+import gc
 
 
 logger = get_logger()
@@ -47,7 +48,6 @@ logger = get_logger()
 
 def _rfpi_worker_init(model_base_path: str, scaler_path: str,
                        covariate_paths: dict, mastergrid_path: str) -> None:
-    """Chạy 1 lần khi mỗi process con khởi động: tự mở R session + raster riêng."""
     global _worker_model, _worker_scaler, _worker_src, _worker_mst
     _worker_model = RandomForestIntervalEstimator.load(model_base_path)
     _worker_scaler = joblib.load(scaler_path)
@@ -56,11 +56,8 @@ def _rfpi_worker_init(model_base_path: str, scaler_path: str,
 
 
 def _rfpi_worker_process_district(args) -> tuple:
-    """
-    Xử lý 1 district trong process con: tự đọc window covariate + mastergrid
-    riêng (không nhận mảng lớn từ main process), predict interval, scale theo
-    census. Trả về mảng NHỎ (chỉ kích thước bounding box) để IPC nhẹ.
-    """
+    global _worker_call_count
+
     (district_id, row_start, row_stop, col_start, col_stop,
      names, alpha, log_scale, census_total, nodata) = args
 
@@ -69,11 +66,13 @@ def _rfpi_worker_process_district(args) -> tuple:
     mst_win = _worker_mst.read(1, window=window)
     district_mask = (mst_win == district_id)
     out_shape = mst_win.shape
+    del mst_win  # không cần giữ sau khi có mask
 
     df = pd.DataFrame()
     for s in _worker_src:
-        arr = _worker_src[s].read(1, window=window)
+        arr = _worker_src[s].read(1, window=window).astype('float32')  # float32 thay vì float64 mặc định
         df[s + '_avg'] = arr.flatten()
+        del arr
     df = df[names]
 
     valid_mask = df.notna().all(axis=1).values & district_mask.flatten()
@@ -83,13 +82,19 @@ def _rfpi_worker_process_district(args) -> tuple:
     upper_arr = np.full(n_pixels, nodata, dtype='float32')
 
     valid_idx = np.where(valid_mask)[0]
+    del valid_mask
 
     if valid_idx.size > 0:
         X_valid = df.iloc[valid_idx]
+        del df  # drop DataFrame full-size ngay, chỉ giữ phần valid
+
         sx = _worker_scaler.transform(X_valid)
+        del X_valid
 
         out = _worker_model.predict(sx, alpha=alpha)
+        del sx
         yp, ylo, yhi = out['pred'], out['lower'], out['upper']
+        del out
 
         if log_scale:
             yp, ylo, yhi = np.exp(yp), np.exp(ylo), np.exp(yhi)
@@ -97,21 +102,24 @@ def _rfpi_worker_process_district(args) -> tuple:
         pred_arr[valid_idx] = yp
         lower_arr[valid_idx] = ylo
         upper_arr[valid_idx] = yhi
+        del yp, ylo, yhi
 
-        # --- Dasymetric: scale để tổng dự đoán khớp với census của quận/huyện ---
         predicted_total = pred_arr[valid_idx].sum()
-        if predicted_total > 0:
-            factor = census_total / predicted_total
-        else:
-            factor = 0.0
+        factor = census_total / predicted_total if predicted_total > 0 else 0.0
 
         pred_arr[valid_idx] *= factor
         lower_arr[valid_idx] *= factor
         upper_arr[valid_idx] *= factor
+    else:
+        del df
 
-    return (district_id, row_start, row_stop, col_start, col_stop,
-            pred_arr.reshape(out_shape), lower_arr.reshape(out_shape),
-            upper_arr.reshape(out_shape), district_mask)
+    del valid_idx
+
+    result = (district_id, row_start, row_stop, col_start, col_stop,
+              pred_arr.reshape(out_shape), lower_arr.reshape(out_shape),
+              upper_arr.reshape(out_shape), district_mask)
+
+    return result
 
 
 class Model:
@@ -632,6 +640,7 @@ class Model:
                 mp_context=ctx,
                 initializer=_rfpi_worker_init,
                 initargs=(str(tmp_base), str(tmp_scaler_path), covariate_paths, mastergrid_path),
+                max_tasks_per_child=10
             ) as executor:
                 futures = [executor.submit(_rfpi_worker_process_district, t) for t in tasks]
 
@@ -648,15 +657,20 @@ class Model:
                     existing_pred = dst_handles['pred'].read(1, window=window)
                     new_pred = np.where(district_mask, pred_win, existing_pred)
                     dst_handles['pred'].write(new_pred, window=window, indexes=1)
-
+                    del existing_pred, new_pred
+                    
                     existing_lower = dst_handles['lower'].read(1, window=window)
                     new_lower = np.where(district_mask, lower_win, existing_lower)
                     dst_handles['lower'].write(new_lower, window=window, indexes=1)
-
+                    del existing_lower, new_lower
+                    
                     existing_upper = dst_handles['upper'].read(1, window=window)
                     new_upper = np.where(district_mask, upper_win, existing_upper)
                     dst_handles['upper'].write(new_upper, window=window, indexes=1)
+                    del existing_upper, new_upper
 
+                    del pred_win, lower_win, upper_win, district_mask
+                    
                     progress['done'] += 1
                     if progress['done'] % 10 == 0 or progress['done'] == progress['total']:
                         logger.info(f"District progress: {progress['done']}/{progress['total']} "
