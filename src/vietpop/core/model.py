@@ -667,7 +667,7 @@ class Model:
                     dst_handles['upper'].write(new_upper, window=window, indexes=1)
                     del existing_upper, new_upper
 
-                    del pred_win, lower_win, upper_win, district_mask
+                    del futures[fut]
                     progress['done'] += 1
                     if progress['done'] % 10 == 0 or progress['done'] == progress['total']:
                         logger.info(f"District progress: {progress['done']}/{progress['total']} "
