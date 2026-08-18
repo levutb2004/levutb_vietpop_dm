@@ -557,11 +557,11 @@ class Model:
 
         max_workers = max_workers or self.settings.max_workers
 
-        id_col = self.settings.district_census['id_column']
-        pop_col = self.settings.district_census['pop_column']
+        id_col = self.settings.census['id_column']
+        pop_col = self.settings.census['pop_column']
 
         # --- Load census: dict {district_id: population} ---
-        census_source = self.settings.district_census['path']
+        census_source = self.settings.census['path']
         census_df = pd.read_csv(census_source)
         census = dict(zip(census_df[id_col], census_df[pop_col]))
 
@@ -576,7 +576,7 @@ class Model:
         joblib.dump(self.scaler, tmp_scaler_path)
 
         covariate_paths = dict(self.settings.covariate)
-        mastergrid_path = self.settings.district_mastergrid
+        mastergrid_path = self.settings.mastergrid
 
         mst = None
         dst_handles = {}
@@ -615,7 +615,7 @@ class Model:
 
             district_ids = [d for d in census.keys()
                             if 0 < d <= max_label and objects[int(d) - 1] is not None]
-            logger.info(f"Processing {len(district_ids)} districts (of {len(census)} in census table) "
+            logger.info(f"Processing {len(district_ids)} admins (of {len(census)} in census table) "
                         f"across {max_workers} worker process(es)")
 
             # --- Build task args (nhẹ: chỉ toạ độ + metadata, KHÔNG kèm mảng lớn) ---
@@ -667,7 +667,6 @@ class Model:
                     dst_handles['upper'].write(new_upper, window=window, indexes=1)
                     del existing_upper, new_upper
 
-                    del futures[fut]
                     progress['done'] += 1
                     if progress['done'] % 10 == 0 or progress['done'] == progress['total']:
                         logger.info(f"District progress: {progress['done']}/{progress['total']} "
@@ -722,7 +721,9 @@ class Model:
         census_source = self.settings.district_census['path']
         census_df = pd.read_csv(census_source)
         census = dict(zip(census_df[id_col], census_df[pop_col]))
-
+        del census_df
+        gc.collect()
+        
         src = {}
         mst = None
         dst_handles = {}
