@@ -26,7 +26,7 @@ trainlr:
 
 run:
 	@echo "Running application..."
-	set PYTHONPATH=$(PYTHONPATH) && $(PYTHON) -m $(SCRIPT) run -c $(CONFIG) --verbose --model-type $(MODEL)
+	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m $(SCRIPT) run -c $(CONFIG) --verbose --model-type $(MODEL)
 
 runmlp:
 	@echo "Running application..."
@@ -64,6 +64,6 @@ commpopdiag:
 
 pixelpopdiag:
 	@echo "Running pixel-level diagnostics..."
-	set PYTHONPATH=$(PYTHONPATH) && $(PYTHON) -m $(SCRIPT) pixelpopdiag -c $(CONFIG) -m prj_vn_2019/output/$(MODEL).pkl.gz --verbose
+	PYTHONPATH=$(PYTHONPATH) $(PYTHON) -m $(SCRIPT) pixelpopdiag -c $(CONFIG) -m prj_vn_2019/output/$(MODEL).pkl.gz --verbose
 
 

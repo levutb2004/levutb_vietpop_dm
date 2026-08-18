@@ -722,7 +722,7 @@ def pixelpopdiag(config_file: str, model_path: str, verbose: bool) -> None:
                    model_type=model_type,
                    config_file=config_file):
         diag = PixelPopDiagnostics(settings)
-        if model_type == 'bart':
+        if model_type == 'bart' or model_type == 'rf-pi':
             results = diag.evaluatePI()
         else: 
             results = diag.evaluate()
