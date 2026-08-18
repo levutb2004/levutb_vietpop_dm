@@ -27,6 +27,7 @@ from pathlib import Path
 import geopandas as gpd
 from libpysal.weights import Queen
 import gc
+import tempfile, os
 
 class BaseEstimator(ABC):
     """
@@ -96,13 +97,15 @@ class RandomForestIntervalEstimator(BaseEstimator):
         num_trees: int = 200,
         alpha: float = 0.05,
         random_state: int = 0,
+        restart_every: int = 10,
         **ranger_kwargs,
     ):
         self.num_trees = num_trees
         self.alpha = alpha
         self.random_state = random_state
         self.ranger_kwargs = ranger_kwargs
-
+        self.restart_every = restart_every
+        self._predict_calls = 0
         self._selected_features = None
         self._train_x_df = None
         self._train_y = None
@@ -117,10 +120,52 @@ class RandomForestIntervalEstimator(BaseEstimator):
         self._ro = ro
         self._ranger = importr("ranger")
         self._forest_error = importr("forestError")
-        import rpy2.rinterface_lib.callbacks as rcb
-        rcb.consolewrite_print = lambda s: None      # chặn stdout (cat/print/progress bar)
+        #import rpy2.rinterface_lib.callbacks as rcb
+        #rcb.consolewrite_print = lambda s: None      # chặn stdout (cat/print/progress bar)
         self._r_ready = True
+    def _restart_r_backend(self):
 
+        tmp_dir = tempfile.mkdtemp(prefix="rf_pi_restart_")
+        rf_path = os.path.join(tmp_dir, "rf.rds")
+        nodes_path = os.path.join(tmp_dir, "train_nodes.rds")
+
+        try:
+            ro.globalenv["rf"] = self._rf
+            ro.globalenv["train_nodes"] = self._train_nodes
+            ro.globalenv["._rf_path."] = rf_path
+            ro.globalenv["._nodes_path."] = nodes_path
+            ro.r("""
+                saveRDS(rf, ._rf_path.)
+                saveRDS(train_nodes, ._nodes_path.)
+            """)
+
+            # Xoá toàn bộ object trong R global env, gc() để trả bớt bộ nhớ
+            ro.r("rm(list = ls(envir = .GlobalEnv)); gc(reset = TRUE); gc(reset = TRUE)")
+
+            # Nạp lại train_x/train_y (phía Python) + rf/train_nodes (từ RDS)
+            ro.globalenv["train_x"] = self._pandas_to_r(self._train_x_df)
+            ro.globalenv["train_y"] = ro.FloatVector(self._train_y.tolist())
+            ro.globalenv["._rf_path."] = rf_path
+            ro.globalenv["._nodes_path."] = nodes_path
+            ro.r("""
+                rf <- readRDS(._rf_path.)
+                train_nodes <- readRDS(._nodes_path.)
+            """)
+
+            self._rf = ro.globalenv["rf"]
+            self._train_nodes = ro.globalenv["train_nodes"]
+        except Exception as e:
+            print(str(e))
+        finally:
+            for p in (rf_path, nodes_path):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+            try:
+                os.rmdir(tmp_dir)
+            except OSError:
+                pass
     @staticmethod
     def _pandas_to_r(df: pd.DataFrame):
         with localconverter(default_converter + pandas2ri.converter):
@@ -351,7 +396,8 @@ class RandomForestIntervalEstimator(BaseEstimator):
     ) -> dict:
 
         self._init_r()
-
+        if self.restart_every and self._predict_calls % self.restart_every == 0:
+            self._restart_r_backend()
         if self._train_x_df is None or self._rf is None:
             raise RuntimeError("Model has not been fitted yet.")
 
@@ -378,12 +424,15 @@ class RandomForestIntervalEstimator(BaseEstimator):
             X,
             columns=list(self._train_x_df.columns),
         ).reset_index(drop=True)
+        del X
+        gc.collect()
         if self._train_nodes is None:
             raise RuntimeError("train_nodes chưa có -- model chưa được fit đúng cách.")
         # Gắn tường minh forest + train data của CHÍNH instance này vào R globalenv,
         # không phụ thuộc trạng thái global còn sót lại từ fit() của instance khác.
         ro.globalenv["test_x"] = self._pandas_to_r(Xdf)
-
+        ro.globalenv["alpha"] = self.alpha
+        del Xdf
         ro.r(
             """
             out <- forestError::quantForestError(
@@ -397,6 +446,8 @@ class RandomForestIntervalEstimator(BaseEstimator):
             )
             """
         )
+        ro.r("gc()")
+        gc.collect()
         result_df = self._r_to_pandas(ro.r("out"))
         
         ro.r(
@@ -405,7 +456,7 @@ class RandomForestIntervalEstimator(BaseEstimator):
                    envir = .GlobalEnv)
                 """
             )
-        del Xdf
+        
         ro.r("gc()")
         gc.collect()
         
@@ -429,7 +480,7 @@ class RandomForestIntervalEstimator(BaseEstimator):
         upper_candidates = [c for c in columns if str(c).lower().startswith("upper")]
         if not upper_candidates:
             raise RuntimeError(f"Could not find upper interval column. Columns: {columns}")
-
+        self._predict_calls += 1
         return {
             "pred": np.asarray(result_df[pred_candidates[0]], dtype=np.float64),
             "lower": np.asarray(result_df[lower_candidates[0]], dtype=np.float64),
