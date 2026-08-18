@@ -406,8 +406,8 @@ class RandomForestIntervalEstimator(BaseEstimator):
                 """
             )
         del Xdf
-        ro.r("gc(verbose = FALSE)")
         gc.collect()
+        ro.r("gc(verbose = FALSE)")
         
         if not isinstance(result_df, pd.DataFrame):
             result_df = pd.DataFrame(result_df)

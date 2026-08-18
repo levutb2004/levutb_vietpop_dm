@@ -29,9 +29,98 @@ from ..utils.raster_processing import progress_bar
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import multiprocessing as mp
 from .diagnostics import ResidualDiagnostics
+import gc
+import os
+import psutil
 
 logger = get_logger()
 
+
+# ============================================================================
+# RF-PI multiprocessing worker functions (module-level bắt buộc để pickle được
+# khi dùng ProcessPoolExecutor với mp_context='spawn').
+#
+# rpy2/R chỉ có MỘT R interpreter cho toàn bộ process, và interpreter đó
+# KHÔNG thread-safe -> không thể dùng ThreadPoolExecutor cho RF-PI (khác BART).
+# Multiprocessing giải quyết được vì mỗi process con tự khởi tạo R session
+# riêng (qua RandomForestIntervalEstimator.load trong _rfpi_worker_init),
+# hoàn toàn độc lập với R session của process cha.
+# ============================================================================
+
+def _rfpi_worker_init(model_base_path: str, scaler_path: str,
+                       covariate_paths: dict, mastergrid_path: str) -> None:
+    global _worker_model, _worker_scaler, _worker_src, _worker_mst
+    _worker_model = RandomForestIntervalEstimator.load(model_base_path)
+    _worker_scaler = joblib.load(scaler_path)
+    _worker_src = {k: rasterio.open(p, 'r') for k, p in covariate_paths.items()}
+    _worker_mst = rasterio.open(mastergrid_path, 'r')
+
+
+def _rfpi_worker_process_district(args) -> tuple:
+    global _worker_call_count
+
+    (district_id, row_start, row_stop, col_start, col_stop,
+     names, alpha, log_scale, census_total, nodata) = args
+
+    window = Window(col_start, row_start, col_stop - col_start, row_stop - row_start)
+
+    mst_win = _worker_mst.read(1, window=window)
+    district_mask = (mst_win == district_id)
+    out_shape = mst_win.shape
+    del mst_win  # không cần giữ sau khi có mask
+
+    df = pd.DataFrame()
+    for s in _worker_src:
+        arr = _worker_src[s].read(1, window=window).astype('float32')  # float32 thay vì float64 mặc định
+        df[s + '_avg'] = arr.flatten()
+        del arr
+    df = df[names]
+
+    valid_mask = df.notna().all(axis=1).values & district_mask.flatten()
+    n_pixels = len(df)
+    pred_arr = np.full(n_pixels, nodata, dtype='float32')
+    lower_arr = np.full(n_pixels, nodata, dtype='float32')
+    upper_arr = np.full(n_pixels, nodata, dtype='float32')
+
+    valid_idx = np.where(valid_mask)[0]
+    del valid_mask
+
+    if valid_idx.size > 0:
+        X_valid = df.iloc[valid_idx]
+        del df  # drop DataFrame full-size ngay, chỉ giữ phần valid
+
+        sx = _worker_scaler.transform(X_valid)
+        del X_valid
+
+        out = _worker_model.predict(sx, alpha=alpha)
+        del sx
+        yp, ylo, yhi = out['pred'], out['lower'], out['upper']
+        del out
+
+        if log_scale:
+            yp, ylo, yhi = np.exp(yp), np.exp(ylo), np.exp(yhi)
+
+        pred_arr[valid_idx] = yp
+        lower_arr[valid_idx] = ylo
+        upper_arr[valid_idx] = yhi
+        del yp, ylo, yhi
+
+        predicted_total = pred_arr[valid_idx].sum()
+        factor = census_total / predicted_total if predicted_total > 0 else 0.0
+
+        pred_arr[valid_idx] *= factor
+        lower_arr[valid_idx] *= factor
+        upper_arr[valid_idx] *= factor
+    else:
+        del df
+
+    del valid_idx
+
+    result = (district_id, row_start, row_stop, col_start, col_stop,
+              pred_arr.reshape(out_shape), lower_arr.reshape(out_shape),
+              upper_arr.reshape(out_shape), district_mask)
+
+    return result
 
 class Model:
     """
@@ -422,15 +511,27 @@ class Model:
     @with_non_interactive_matplotlib
     def predict_grid_interval(self,
                         log_scale: bool = False,
-                        alpha: float = 0.05) -> dict:
+                        alpha: float = 0.05,
+                        max_workers: Optional[int] = None) -> dict:
         """
         Dự đoán RF (point + prediction interval) theo từng quận/huyện
         (dựa trên mastergrid) và scale kết quả để tổng dân số dự đoán
         trong mỗi quận/huyện khớp với census — dùng RandomForestIntervalEstimator
         (ranger + forestError).
 
-        Note: rpy2/R không thread-safe -> xử lý tuần tự theo district,
-        KHÔNG dùng ThreadPoolExecutor (khác với predict_bart_grid).
+        Chạy bằng multiprocessing THẬT SỰ (ProcessPoolExecutor, mp_context=
+        'spawn'), KHÔNG dùng ThreadPoolExecutor: rpy2/R chỉ có 1 R interpreter
+        cho toàn process và không thread-safe, nên nhiều thread gọi predict()
+        cùng lúc sẽ đụng độ R globalenv. Mỗi process con tự khởi tạo R session
+        + tự đọc raster của riêng nó (chỉ giữ dữ liệu 1 district tại một thời
+        điểm) -> phù hợp cả với dataset rất nặng.
+
+        Args:
+            log_scale: Nếu True, exp() kết quả trước khi scale theo census.
+            alpha: Mức ý nghĩa cho prediction interval (mặc định 0.05).
+            max_workers: Số process song song. Mặc định lấy từ
+                         self.settings.max_workers. Mỗi worker tốn RAM cho
+                         1 R session + model -> đừng đặt quá cao so với RAM.
 
         Returns:
             dict: {'pred': path, 'lower': path, 'upper': path}
@@ -438,7 +539,7 @@ class Model:
         Raises:
             RuntimeError: If model is not trained, or estimator has no predict()
         """
-        logger.info("Starting RF prediction-interval generation (district-level dasymetric)")
+        logger.info("Starting RF prediction-interval generation (multiprocessing, district-level dasymetric)")
 
         if self.model is None or self.scaler is None:
             logger.error("Model not trained. Call train() first")
@@ -448,6 +549,13 @@ class Model:
                 "Loaded estimator does not support predict(). "
                 "Train with --model-type rf-pi (or --predict-interval)."
             )
+        if not isinstance(self.model, RandomForestIntervalEstimator):
+            raise RuntimeError(
+                "predict_grid_interval() chỉ hỗ trợ RandomForestIntervalEstimator "
+                f"(rpy2/ranger/forestError), nhận được: {type(self.model)}"
+            )
+
+        max_workers = max_workers or self.settings.max_workers
 
         id_col = self.settings.district_census['id_column']
         pop_col = self.settings.district_census['pop_column']
@@ -457,17 +565,25 @@ class Model:
         census_df = pd.read_csv(census_source)
         census = dict(zip(census_df[id_col], census_df[pop_col]))
 
-        src = {}
+        # --- Dump model + scaler ra đĩa để mỗi process con tự load lại ---
+        # (rpy2 R objects và closures không pickle được qua process boundary,
+        # nên KHÔNG thể truyền self.model trực tiếp cho worker)
+        tmp_base = self.output_dir / f'_{self.model_type}_mp_worker'
+        tmp_scaler_path = self.output_dir / f'_{self.model_type}_mp_worker_scaler.pkl.gz'
+        logger.debug(f"Dumping model/scaler cho worker tại: {tmp_base}.* / {tmp_scaler_path}")
+        self.model.selected_features = self.selected_features
+        self.model.save(str(tmp_base))
+        joblib.dump(self.scaler, tmp_scaler_path)
+
+        covariate_paths = dict(self.settings.covariate)
+        mastergrid_path = self.settings.district_mastergrid
+
         mst = None
         dst_handles = {}
         try:
-            logger.debug("Opening covariate rasters")
-            for k in self.settings.covariate:
-                src[k] = rasterio.open(self.settings.covariate[k], 'r')
-
-            logger.debug("Opening mastergrid")
-            mst = rasterio.open(self.settings.district_mastergrid, 'r')
-            mst_arr = mst.read(1)  # load toàn bộ mastergrid vào RAM (chấp nhận được ở 100m/VN)
+            logger.debug("Opening mastergrid (main process, chỉ để tính bounding box)")
+            mst = rasterio.open(mastergrid_path, 'r')
+            mst_arr = mst.read(1)
 
             profile = mst.profile.copy()
             profile.update({'dtype': 'float32'})
@@ -493,100 +609,77 @@ class Model:
             # --- Bounding box mỗi district bằng scipy.ndimage.find_objects ---
             max_label = int(np.nanmax(mst_arr))
             objects = ndimage.find_objects(mst_arr.astype(np.int32), max_label=max_label)
+            del mst_arr  # không cần giữ toàn bộ mastergrid trong RAM main process nữa
+            mst.close()
+            mst = None
 
             district_ids = [d for d in census.keys()
                             if 0 < d <= max_label and objects[int(d) - 1] is not None]
-            logger.info(f"Processing {len(district_ids)} districts (of {len(census)} in census table)")
+            logger.info(f"Processing {len(district_ids)} districts (of {len(census)} in census table) "
+                        f"across {max_workers} worker process(es)")
 
-            progress = {'done': 0, 'total': len(district_ids)}
-
-            def process_district(district_id):
+            # --- Build task args (nhẹ: chỉ toạ độ + metadata, KHÔNG kèm mảng lớn) ---
+            tasks = []
+            for district_id in district_ids:
                 row_slice, col_slice = objects[int(district_id) - 1]
-                window = Window(col_slice.start, row_slice.start,
-                                col_slice.stop - col_slice.start,
-                                row_slice.stop - row_slice.start)
+                tasks.append((
+                    district_id,
+                    row_slice.start, row_slice.stop,
+                    col_slice.start, col_slice.stop,
+                    names, alpha, log_scale,
+                    census[district_id], nodata,
+                ))
 
-                mst_win = mst_arr[row_slice, col_slice]
-                district_mask = (mst_win == district_id)
-                out_shape = mst_win.shape
+            progress = {'done': 0, 'total': len(tasks)}
 
-                df = pd.DataFrame()
-                for s in src:
-                    arr = src[s].read(1, window=window)
-                    df[s + '_avg'] = arr.flatten()
-                df = df[names]
+            # --- spawn (không fork): R embedded interpreter không an toàn khi
+            #     fork một process cha đã có R session đang chạy ---
+            ctx = mp.get_context('spawn')
+            with ProcessPoolExecutor(
+                max_workers=max_workers,
+                mp_context=ctx,
+                initializer=_rfpi_worker_init,
+                initargs=(str(tmp_base), str(tmp_scaler_path), covariate_paths, mastergrid_path),
+            ) as executor:
+                futures = [executor.submit(_rfpi_worker_process_district, t) for t in tasks]
 
-                valid_mask = df.notna().all(axis=1).values & district_mask.flatten()
-                n_pixels = len(df)
-                pred_arr = np.full(n_pixels, nodata, dtype='float32')
-                lower_arr = np.full(n_pixels, nodata, dtype='float32')
-                upper_arr = np.full(n_pixels, nodata, dtype='float32')
+                for fut in progress_bar(as_completed(futures), self.settings.show_progress,
+                                         len(futures), desc="RF Dasymetric Prediction Interval"):
+                    (district_id, row_start, row_stop, col_start, col_stop,
+                     pred_win, lower_win, upper_win, district_mask) = fut.result()
+                    window = Window(col_start, row_start, col_stop - col_start, row_stop - row_start)
 
-                valid_idx = np.where(valid_mask)[0]
+                    # --- Ghi kết quả tuần tự ở main process: read-modify-write
+                    #     vì bbox các quận có thể chồng nhau, và tránh nhiều
+                    #     process cùng ghi vào 1 file .tif ---
+                    existing_pred = dst_handles['pred'].read(1, window=window)
+                    new_pred = np.where(district_mask, pred_win, existing_pred)
+                    dst_handles['pred'].write(new_pred, window=window, indexes=1)
+                    del existing_pred, new_pred
+                    
+                    existing_lower = dst_handles['lower'].read(1, window=window)
+                    new_lower = np.where(district_mask, lower_win, existing_lower)
+                    dst_handles['lower'].write(new_lower, window=window, indexes=1)
+                    del existing_lower, new_lower
+                    
+                    existing_upper = dst_handles['upper'].read(1, window=window)
+                    new_upper = np.where(district_mask, upper_win, existing_upper)
+                    dst_handles['upper'].write(new_upper, window=window, indexes=1)
+                    del existing_upper, new_upper
 
-                if valid_idx.size > 0:
-                    X_valid = df.iloc[valid_idx]
-                    sx = self.scaler.transform(X_valid)
-
-                    # rpy2 không thread-safe -> gọi tuần tự, trong process_district
-                    out = self.model.predict(sx, alpha=alpha)
-                    yp, ylo, yhi = out['pred'], out['lower'], out['upper']
-
-                    if log_scale:
-                        yp, ylo, yhi = np.exp(yp), np.exp(ylo), np.exp(yhi)
-
-                    pred_arr[valid_idx] = yp
-                    lower_arr[valid_idx] = ylo
-                    upper_arr[valid_idx] = yhi
-
-                    # --- Dasymetric: scale để tổng dự đoán khớp với census của quận/huyện ---
-                    predicted_total = pred_arr[valid_idx].sum()
-                    census_total = census[district_id]
-                    if predicted_total > 0:
-                        factor = census_total / predicted_total
-                    else:
-                        logger.warning(f"District {district_id}: predicted_total=0, bỏ qua scaling")
-                        factor = 0.0
-
-                    pred_arr[valid_idx] *= factor
-                    lower_arr[valid_idx] *= factor
-                    upper_arr[valid_idx] *= factor
-
-                # --- Ghi kết quả: read-modify-write vì bbox các quận có thể chồng nhau ---
-                existing_pred = dst_handles['pred'].read(1, window=window)
-                new_pred = np.where(district_mask, pred_arr.reshape(out_shape), existing_pred)
-                dst_handles['pred'].write(new_pred, window=window, indexes=1)
-
-                existing_lower = dst_handles['lower'].read(1, window=window)
-                new_lower = np.where(district_mask, lower_arr.reshape(out_shape), existing_lower)
-                dst_handles['lower'].write(new_lower, window=window, indexes=1)
-
-                existing_upper = dst_handles['upper'].read(1, window=window)
-                new_upper = np.where(district_mask, upper_arr.reshape(out_shape), existing_upper)
-                dst_handles['upper'].write(new_upper, window=window, indexes=1)
-
-                progress['done'] += 1
-                if progress['done'] % 10 == 0 or progress['done'] == progress['total']:
-                    logger.info(f"District progress: {progress['done']}/{progress['total']} "
-                                f"({100*progress['done']/progress['total']:.1f}%)")
-
-            # --- rpy2/R không thread-safe -> xử lý tuần tự, KHÔNG dùng ThreadPoolExecutor ---
-            logger.info("Processing districts sequentially (R backend is not thread-safe)")
-            for district_id in progress_bar(district_ids, self.settings.show_progress,
-                                            len(district_ids), desc="RF Dasymetric Prediction Interval"):
-                process_district(district_id)
-
+                    del futures[fut]
+                    progress['done'] += 1
+                    if progress['done'] % 10 == 0 or progress['done'] == progress['total']:
+                        logger.info(f"District progress: {progress['done']}/{progress['total']} "
+                                    f"({100*progress['done']/progress['total']:.1f}%)")
+                    
+            gc.collect()
         except Exception as e:
             logger.error(f"Error during dasymetric prediction interval: {str(e)}")
             import traceback
             logger.error(f"Full traceback: {traceback.format_exc()}")
             raise
         finally:
-            for k in src:
-                try:
-                    src[k].close()
-                except Exception as e:
-                    logger.warning(f"Error closing source {k}: {str(e)}")
             if mst is not None:
                 try:
                     mst.close()
@@ -597,8 +690,15 @@ class Model:
                     handle.close()
                 except Exception as e:
                     logger.warning(f"Error closing output raster: {str(e)}")
+            # --- Dọn file tạm dùng để truyền model/scaler cho worker ---
+            for p in (tmp_base.with_suffix('.rds'), tmp_base.with_suffix('.pkl'), tmp_scaler_path):
+                try:
+                    if p.exists():
+                        p.unlink()
+                except Exception as e:
+                    logger.warning(f"Error removing temp worker file {p}: {str(e)}")
 
-        logger.info("RF dasymetric prediction interval completed successfully")
+        logger.info("RF dasymetric prediction interval (multiprocessing) completed successfully")
         return {k: str(v) for k, v in outfiles.items()}
     @with_non_interactive_matplotlib
     def predict_bart_grid(self, log_scale: bool = False) -> dict:
