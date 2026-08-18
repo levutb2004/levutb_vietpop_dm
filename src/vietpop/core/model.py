@@ -121,15 +121,6 @@ def _rfpi_worker_process_district(args) -> tuple:
               upper_arr.reshape(out_shape), district_mask)
 
     return result
-def log_mem(label, district_id):
-    p = psutil.Process(os.getpid())
-    logger(
-        f"[MEM] {label} | "
-        f"PID={os.getpid()} | "
-        f"district={district_id} | "
-        f"RSS={p.memory_info().rss / 1024**3:.2f} GB",
-        flush=True,
-    )
 
 class Model:
     """
@@ -656,7 +647,6 @@ class Model:
                                          len(futures), desc="RF Dasymetric Prediction Interval"):
                     (district_id, row_start, row_stop, col_start, col_stop,
                      pred_win, lower_win, upper_win, district_mask) = fut.result()
-                    log_mem("START", district_id)
                     window = Window(col_start, row_start, col_stop - col_start, row_stop - row_start)
 
                     # --- Ghi kết quả tuần tự ở main process: read-modify-write
@@ -678,7 +668,6 @@ class Model:
                     del existing_upper, new_upper
 
                     del pred_win, lower_win, upper_win, district_mask
-                    log_mem("END", district_id)
                     progress['done'] += 1
                     if progress['done'] % 10 == 0 or progress['done'] == progress['total']:
                         logger.info(f"District progress: {progress['done']}/{progress['total']} "
