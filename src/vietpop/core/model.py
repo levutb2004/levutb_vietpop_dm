@@ -512,7 +512,7 @@ class Model:
                 if valid_idx.size > 0:
                     sx = self.scaler.transform(df.iloc[valid_idx])
                     samples = self.model.predict_quantiles(sx, quantiles=quantiles)
-
+                    samples = samples.T
                     if log_scale:
                         samples = np.exp(samples)
 
@@ -525,7 +525,7 @@ class Model:
                         out=np.zeros_like(sample_totals, dtype=np.float64),
                         where=sample_totals > 0
                     )
-
+                    
                     samples *= factors[:, None]
                     mean_arr[valid_idx] = samples.mean(axis=0)
                     for p in percentiles:
