@@ -127,7 +127,7 @@ class Model:
             self.model = self._estimator
             logger.debug(f"Initialized {self.model.__class__.__name__}")
 
-            if not isinstance(self.model, (GLMEstimator, RandomForestIntervalEstimator)):
+            if not isinstance(self.model, (GLMEstimator, QuantileForestIntervalEstimator)):
                 with joblib_resources():
                     logger.info("Performing feature selection")
                     importances, selected = self._select_features(X_scaled, y)
@@ -155,17 +155,7 @@ class Model:
             with joblib_resources():
                 try:
                     model_path_p = Path(model_path)
-                    is_rfpi_file = (model_path_p.suffix == '.pkl'
-                                     and not model_path_p.name.endswith('.pkl.gz'))
-                    if isinstance(self._estimator, RandomForestIntervalEstimator) or is_rfpi_file:
-                        # rpy2/R objects không pickle được qua joblib -> dùng
-                        # loader riêng của RandomForestIntervalEstimator, load
-                        # từ cặp file <base>.rds / <base>.pkl
-                        rfpi_base = str(model_path_p.with_suffix(''))
-                        logger.debug(f"Loading RF-PI model (rpy2) from base path: {rfpi_base}")
-                        self.model = RandomForestIntervalEstimator.load(rfpi_base)
-                    else:
-                        self.model = joblib.load(model_path)
+                    self.model = joblib.load(model_path)
                     self.selected_features = self.model.selected_features
                     logger.debug("Model loaded successfully")
                 except Exception as e:
