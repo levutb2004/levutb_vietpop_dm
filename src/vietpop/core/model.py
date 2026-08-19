@@ -424,7 +424,7 @@ class Model:
                 "Train with Quantile Random Forest."
             )
 
-        quantiles = np.linspace(0.005, 0.995, 100)
+        quantiles = np.linspace(0.005, 0.995, 100).tolist()
         percentiles = [2.5, 97.5]
         
         id_col = self.settings.census["id_column"]
