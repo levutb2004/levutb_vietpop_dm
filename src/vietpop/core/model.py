@@ -16,7 +16,7 @@ from sklearn.preprocessing import RobustScaler
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import cross_validate
 from sklearn.inspection import permutation_importance
-from .base_model import BaseEstimator, GLMEstimator, RandomForestEstimator, RandomForestIntervalEstimator  # thêm import
+from .base_model import BaseEstimator, GLMEstimator, RandomForestEstimator, QuantileForestIntervalEstimator  # thêm import
 from rasterio.windows import Window
 import pymc as pm
 import pymc_bart as pmb
@@ -421,135 +421,69 @@ class Model:
         return str(outfile)
     @with_non_interactive_matplotlib
     def predict_grid_interval(self, log_scale: bool = False) -> dict:
-        """Dự đoán Quantile RF theo từng quận/huyện và scale
-        kết quả để tổng dân số dự đoán trong mỗi quận/huyện
-        khớp với census.
-
-        Returns:
-            dict: đường dẫn các raster output (mean, p2.5, p97.5)
+        """Dự đoán Quantile RF theo từng quận/huyện và scale kết quả
+        để tổng dân số dự đoán trong mỗi quận/huyện khớp với census.
         """
-
-        logger.info(
-            "Starting Quantile RF prediction with district-level dasymetric mapping"
-        )
+        logger.info("Starting Quantile RF prediction with district-level dasymetric mapping")
 
         if self.model is None or self.scaler is None:
             raise RuntimeError("Model not trained. Call train() first.")
-
         if not hasattr(self.model, "predict_quantiles"):
             raise RuntimeError(
                 "Loaded estimator does not support predict_quantiles(). "
                 "Train with Quantile Random Forest."
             )
 
-        # BART dùng p2.5 và p97.5
-        quantiles = [0.025, 0.5, 0.975]
-
+        quantiles = np.linspace(0.005, 0.995, 100)
+        percentiles = [2.5, 97.5]
+        
         id_col = self.settings.district_census["id_column"]
         pop_col = self.settings.district_census["pop_column"]
-
-        # --- Load census: dict {district_id: population} ---
-        census_source = self.settings.district_census["path"]
-
-        census_df = pd.read_csv(census_source)
-
-        census = dict(
-            zip(
-                census_df[id_col],
-                census_df[pop_col],
-            )
-        )
-
+        census_df = pd.read_csv(self.settings.district_census["path"])
+        census = dict(zip(census_df[id_col], census_df[pop_col]))
         del census_df
         gc.collect()
 
-        src = {}
-        mst = None
-        dst_handles = {}
+        src, mst, dst_handles = {}, None, {}
 
         try:
-            logger.debug("Opening covariate rasters")
-
             for k in self.settings.covariate:
-                src[k] = rasterio.open(
-                    self.settings.covariate[k],
-                    "r",
-                )
+                src[k] = rasterio.open(self.settings.covariate[k], "r")
 
-            logger.debug("Opening mastergrid")
-
-            mst = rasterio.open(
-                self.settings.district_mastergrid,
-                "r",
-            )
-
+            mst = rasterio.open(self.settings.district_mastergrid, "r")
             mst_arr = mst.read(1)
-
             profile = mst.profile.copy()
             profile.update({"dtype": "float32"})
 
             names = self.selected_features
-
-            base_outfile = Path(
-                self.settings.output_raster["prediction"]
-            )
-
-            # --- Output giống BART ---
+            base_outfile = Path(self.settings.output_raster["prediction"])
             outfiles = {
-                "mean": base_outfile.with_name(
-                    base_outfile.stem + "_mean.tif"
-                ),
-                "p25": base_outfile.with_name(
-                    base_outfile.stem + "_p25.tif"
-                ),
-                "p975": base_outfile.with_name(
-                    base_outfile.stem + "_p975.tif"
-                ),
+                "mean": base_outfile.with_name(base_outfile.stem + "_mean.tif"),
+                "p25": base_outfile.with_name(base_outfile.stem + "_p25.tif"),
+                "p975": base_outfile.with_name(base_outfile.stem + "_p975.tif"),
             }
 
             dst_handles = {
-                key: rasterio.open(
-                    path,
-                    "w+",
-                    **profile,
-                )
+                key: rasterio.open(path, "w+", **profile)
                 for key, path in outfiles.items()
             }
 
-            logger.info(
-                f"Output will be saved to: {outfiles}"
-            )
+            logger.info(f"Output will be saved to: {outfiles}")
 
             nodata = profile.get("nodata", -9999.0)
-
-            # --- Ghi nodata cho toàn bộ raster ---
-            init_arr = np.full(
-                (mst.height, mst.width),
-                nodata,
-                dtype="float32",
-            )
-
+            init_arr = np.full((mst.height, mst.width), nodata, dtype="float32")
             for handle in dst_handles.values():
-                handle.write(
-                    init_arr,
-                    indexes=1,
-                )
-
+                handle.write(init_arr, indexes=1)
             del init_arr
 
-            # --- Bounding box mỗi district ---
             max_label = int(np.nanmax(mst_arr))
-
             objects = ndimage.find_objects(
-                mst_arr.astype(np.int32),
-                max_label=max_label,
+                mst_arr.astype(np.int32), max_label=max_label
             )
 
-            district_ids = [ d for d in census.keys()
-                if (
-                    0 < d <= max_label
-                    and objects[int(d) - 1] is not None
-                )
+            district_ids = [
+                d for d in census.keys()
+                if 0 < d <= max_label and objects[int(d) - 1] is not None
             ]
 
             logger.info(
@@ -557,17 +491,10 @@ class Model:
                 f"(of {len(census)} in census table)"
             )
 
-            progress = {
-                "done": 0,
-                "total": len(district_ids),
-            }
+            progress = {"done": 0, "total": len(district_ids)}
 
             def process_district(district_id):
-
-                row_slice, col_slice = objects[
-                    int(district_id) - 1
-                ]
-
+                row_slice, col_slice = objects[int(district_id) - 1]
                 window = Window(
                     col_slice.start,
                     row_slice.start,
@@ -575,181 +502,64 @@ class Model:
                     row_slice.stop - row_slice.start,
                 )
 
-                mst_win = mst_arr[
-                    row_slice,
-                    col_slice,
-                ]
-
-                district_mask = (
-                    mst_win == district_id
-                )
-
+                mst_win = mst_arr[row_slice, col_slice]
+                district_mask = mst_win == district_id
                 out_shape = mst_win.shape
 
-                # --- Read covariates ---
-                df = pd.DataFrame()
+                df = pd.DataFrame({
+                    s + "_avg": src[s].read(1, window=window).flatten()
+                    for s in src
+                })[names]
 
-                for s in src:
-                    arr = src[s].read(
-                        1,
-                        window=window,
-                    )
-
-                    df[s + "_avg"] = arr.flatten()
-
-                df = df[names]
-
-                # --- Valid pixels ---
-                valid_mask = (
-                    df.notna().all(axis=1).values
-                    & district_mask.flatten()
-                )
-
+                valid_mask = df.notna().all(axis=1).values & district_mask.flatten()
                 n_pixels = len(df)
 
-                mean_arr = np.full(
-                    n_pixels,
-                    nodata,
-                    dtype="float32",
-                )
-
-                p25_arr = np.full(
-                    n_pixels,
-                    nodata,
-                    dtype="float32",
-                )
-
-                p975_arr = np.full(
-                    n_pixels,
-                    nodata,
-                    dtype="float32",
-                )
+                mean_arr = np.full(n_pixels, nodata, dtype="float32")
+                pct_arrs = {p: mean_arr.copy() for p in percentiles}
 
                 valid_idx = np.where(valid_mask)[0]
 
                 if valid_idx.size > 0:
-
-                    X_valid = df.iloc[valid_idx]
-
-                    sx = self.scaler.transform(X_valid)
-
-                    q = self.model.predict_quantiles(
-                        sx,
-                        quantiles=quantiles,
-                    )
-
-                    lower = q[:, 0]
-                    mean = q[:, 1]
-                    upper = q[:, 2]
+                    sx = self.scaler.transform(df.iloc[valid_idx])
+                    samples = self.model.predict_quantiles(sx, quantiles=quantiles)
 
                     if log_scale:
-                        lower = np.exp(lower)
-                        mean = np.exp(mean)
-                        upper = np.exp(upper)
-
-                    mean_arr[valid_idx] = mean
-                    p25_arr[valid_idx] = lower
-                    p975_arr[valid_idx] = upper
-
-                    predicted_total = mean_arr[valid_idx].sum()
+                        samples = np.exp(samples)
 
                     census_total = census[district_id]
+                    sample_totals = samples.sum(axis=1)
 
-                    if predicted_total > 0:
+                    factors = np.divide(
+                        census_total,
+                        sample_totals,
+                        out=np.zeros_like(sample_totals, dtype=np.float64),
+                        where=sample_totals > 0
+                    )
 
-                        factor = (
-                            census_total
-                            / predicted_total
-                        )
+                    samples *= factors[:, None]
+                    mean_arr[valid_idx] = samples.mean(axis=0)
+                    for p in percentiles:
+                        pct_arrs[p][valid_idx] = np.percentile(samples,p,axis=0)
 
-                    else:
+                    del samples, factors
 
-                        logger.warning(
-                            f"District {district_id}: "
-                            f"predicted_total=0, "
-                            f"bỏ qua scaling"
-                        )
+                    existing_mean = dst_handles["mean"].read(1, window=window)
+                    new_mean = np.where(district_mask, mean_arr.reshape(out_shape), existing_mean)
+                    dst_handles["mean"].write(new_mean, window=window, indexes=1)
+                    for p in percentiles:
+                        tag = f"p{str(p).replace('.', '')}"
+                        existing = dst_handles[tag].read(1, window=window)
+                        new_val = np.where(district_mask, pct_arrs[p].reshape(out_shape), existing)
+                        dst_handles[tag].write(new_val, window=window, indexes=1)
 
-                        factor = 0.0
-
-                    # Scale cả prediction và interval
-                    mean_arr[valid_idx] *= factor
-                    p25_arr[valid_idx] *= factor
-                    p975_arr[valid_idx] *= factor
-
-                existing_mean = dst_handles["mean"].read(1,window=window)
-
-                new_mean = np.where(
-                    district_mask,
-                    mean_arr.reshape(out_shape),
-                    existing_mean
-                )
-
-                dst_handles["mean"].write(
-                    new_mean,
-                    window=window,
-                    indexes=1
-                )
-
-                # ------------------------------------------------------
-                # Write p2.5
-                # ------------------------------------------------------
-                existing_p25 = dst_handles[
-                    "p25"
-                ].read(
-                    1,
-                    window=window
-                )
-
-                new_p25 = np.where(
-                    district_mask,
-                    p25_arr.reshape(out_shape),
-                    existing_p25
-                )
-
-                dst_handles["p25"].write(
-                    new_p25,
-                    window=window,
-                    indexes=1
-                )
-
-                existing_p975 = dst_handles[
-                    "p975"
-                ].read(
-                    1,
-                    window=window
-                )
-
-                new_p975 = np.where(
-                    district_mask,
-                    p975_arr.reshape(out_shape),
-                    existing_p975
-                )
-
-                dst_handles["p975"].write(
-                    new_p975,
-                    window=window,
-                    indexes=1
-                )
-
-                # ------------------------------------------------------
-                # Progress
-                # ------------------------------------------------------
                 progress["done"] += 1
-
-                if (
-                    progress["done"] % 10 == 0
-                    or progress["done"] == progress["total"]
-                ):
+                if progress["done"] % 10 == 0 or progress["done"] == progress["total"]:
                     logger.info(
-                        f"District progress: "
-                        f"{progress['done']}/{progress['total']} "
+                        f"District progress: {progress['done']}/{progress['total']} "
                         f"({100 * progress['done'] / progress['total']:.1f}%)"
                     )
 
-            logger.info(
-                "Processing districts sequentially"
-            )
+            logger.info("Processing districts sequentially")
 
             for district_id in progress_bar(
                 district_ids,
@@ -760,53 +570,33 @@ class Model:
                 process_district(district_id)
 
         except Exception as e:
-
-            logger.error(
-                f"Error during dasymetric prediction: {str(e)}"
-            )
-
+            logger.error(f"Error during dasymetric prediction: {str(e)}")
             import traceback
-
-            logger.error(
-                f"Full traceback: {traceback.format_exc()}"
-            )
-
+            logger.error(f"Full traceback: {traceback.format_exc()}")
             raise
 
         finally:
-
             for k in src:
                 try:
                     src[k].close()
                 except Exception as e:
-                    logger.warning(
-                        f"Error closing source {k}: {str(e)}"
-                    )
+                    logger.warning(f"Error closing source {k}: {str(e)}")
 
             if mst is not None:
                 try:
                     mst.close()
                 except Exception as e:
-                    logger.warning(
-                        f"Error closing mastergrid: {str(e)}"
-                    )
+                    logger.warning(f"Error closing mastergrid: {str(e)}")
 
             for handle in dst_handles.values():
                 try:
                     handle.close()
                 except Exception as e:
-                    logger.warning(
-                        f"Error closing output raster: {str(e)}"
-                    )
+                    logger.warning(f"Error closing output raster: {str(e)}")
 
-        logger.info(
-            "Quantile RF dasymetric prediction completed successfully"
-        )
+        logger.info("Quantile RF dasymetric prediction completed successfully")
 
-        return {
-            k: str(v)
-            for k, v in outfiles.items()
-        }
+        return {k: str(v) for k, v in outfiles.items()}
     @with_non_interactive_matplotlib
     def predict_bart_grid(self, log_scale: bool = False) -> dict:
         """ Dự đoán BART theo từng quận/huyện (dựa trên mastergrid) và scale
@@ -875,7 +665,7 @@ class Model:
 
             district_ids = [d for d in census.keys()
                             if 0 < d <= max_label and objects[int(d) - 1] is not None]
-            logger.info(f"Processing {len(district_ids)} districts (of {len(census)} in census table)")
+            logger.info(f"Processing {len(district_ids)} admins (of {len(census)} in census table)")
 
             progress_lock = threading.Lock()
             progress = {'done': 0, 'total': len(district_ids)}
@@ -920,24 +710,22 @@ class Model:
                     if log_scale:
                         samples = np.exp(samples)
 
+                    census_total = census[district_id]
+                    sample_totals = samples.sum(axis=1)
+
+                    factors = np.divide(
+                        census_total,
+                        sample_totals,
+                        out=np.zeros_like(sample_totals, dtype=np.float64),
+                        where=sample_totals > 0
+                    )
+
+                    samples *= factors[:, None]
                     mean_arr[valid_idx] = samples.mean(axis=0)
                     for p in percentiles:
-                        pct_arrs[p][valid_idx] = np.percentile(samples, p, axis=0)
-                    del samples
+                        pct_arrs[p][valid_idx] = np.percentile(samples,p,axis=0)
 
-                    # --- Dasymetric: scale để tổng dự đoán khớp với census của quận/huyện ---
-                    predicted_total = mean_arr[valid_idx].sum()
-                    census_total = census[district_id]
-                    if predicted_total > 0:
-                        factor = census_total / predicted_total
-                    else:
-                        logger.warning(f"District {district_id}: predicted_total=0, bỏ qua scaling")
-                        factor = 0.0
-
-                    mean_arr[valid_idx] *= factor
-                    for p in percentiles:
-                        pct_arrs[p][valid_idx] *= factor
-
+                    del samples, factors
                 # --- Ghi kết quả: read-modify-write vì bbox các quận có thể chồng nhau ---
                 with writing_lock:
                     existing_mean = dst_handles["mean"].read(1, window=window)

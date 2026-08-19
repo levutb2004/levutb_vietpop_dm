@@ -9,7 +9,7 @@ CONFIG=prj_vn_2019/config.yaml
 #MODEL=bart
 # MODEL=mlp
 # MODEL=glm
-MODEL=rf-pi
+MODEL=qrf
 
 # Default target
 train:

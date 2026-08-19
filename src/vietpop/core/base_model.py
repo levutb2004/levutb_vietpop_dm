@@ -86,7 +86,7 @@ class RandomForestEstimator(BaseEstimator):
     @selected_features.setter
     def selected_features(self, value):
         self._selected_features = value
-class RandomForestIntervalEstimator(BaseEstimator):
+class QuantileForestIntervalEstimator(BaseEstimator):
 
     def __init__(self,n_estimators: int = 500,random_state: int = 0,**kwargs):
         self._model = RandomForestQuantileRegressor(
@@ -96,7 +96,7 @@ class RandomForestIntervalEstimator(BaseEstimator):
         )
         self._selected_features = None
 
-    def fit(self, X: np.ndarray, y: np.ndarray) -> "RandomForestIntervalEstimator":
+    def fit(self, X: np.ndarray, y: np.ndarray) -> "QuantileForestIntervalEstimator":
         self._model.fit(X, y)
         return self
 

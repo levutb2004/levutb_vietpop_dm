@@ -26,7 +26,7 @@ from ..core.base_model import \
     RandomForestEstimator, \
     NeuralNetEstimator, \
     BARTEstimator, \
-    RandomForestIntervalEstimator#, PyTorchEstimator
+    QuantileForestIntervalEstimator#, PyTorchEstimator
 from ..utils.mlflow_tracker import (
     log_diagnostics, setup_mlflow, start_run,
     log_settings, log_estimator_params,
@@ -39,7 +39,7 @@ logger = get_logger()
 
 ESTIMATOR_MAP = {
     'rf':      RandomForestEstimator,
-    'rf-pi':   RandomForestIntervalEstimator,
+    'qrf':   QuantileForestIntervalEstimator,
     'mlp':     NeuralNetEstimator,
     'lr':      LinearRegressionEstimator,
     'ensemble': EnsembleEstimator,
@@ -466,7 +466,7 @@ def run(config_file: str,
     logger.info("Making predictions...")
     if model_type == 'bart': 
         predictions = model.predict_bart_grid(log_scale=settings.log_scale)
-    elif model_type == 'rf-pi':
+    elif model_type == 'qrf':
         predictions = model.predict_grid_interval(log_scale=settings.log_scale)
     else:
         predictions = model.predict_grid(log_scale=settings.log_scale)
