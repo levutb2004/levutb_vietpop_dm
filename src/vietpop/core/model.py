@@ -437,9 +437,9 @@ class Model:
         quantiles = np.linspace(0.005, 0.995, 100)
         percentiles = [2.5, 97.5]
         
-        id_col = self.settings.district_census["id_column"]
-        pop_col = self.settings.district_census["pop_column"]
-        census_df = pd.read_csv(self.settings.district_census["path"])
+        id_col = self.settings.census["id_column"]
+        pop_col = self.settings.census["pop_column"]
+        census_df = pd.read_csv(self.settings.census["path"])
         census = dict(zip(census_df[id_col], census_df[pop_col]))
         del census_df
         gc.collect()
@@ -450,7 +450,7 @@ class Model:
             for k in self.settings.covariate:
                 src[k] = rasterio.open(self.settings.covariate[k], "r")
 
-            mst = rasterio.open(self.settings.district_mastergrid, "r")
+            mst = rasterio.open(self.settings.mastergrid, "r")
             mst_arr = mst.read(1)
             profile = mst.profile.copy()
             profile.update({"dtype": "float32"})
@@ -487,7 +487,7 @@ class Model:
             ]
 
             logger.info(
-                f"Processing {len(district_ids)} districts "
+                f"Processing {len(district_ids)} admins "
                 f"(of {len(census)} in census table)"
             )
 
@@ -555,11 +555,11 @@ class Model:
                 progress["done"] += 1
                 if progress["done"] % 10 == 0 or progress["done"] == progress["total"]:
                     logger.info(
-                        f"District progress: {progress['done']}/{progress['total']} "
+                        f"Admins progress: {progress['done']}/{progress['total']} "
                         f"({100 * progress['done'] / progress['total']:.1f}%)"
                     )
 
-            logger.info("Processing districts sequentially")
+            logger.info("Processing admins sequentially")
 
             for district_id in progress_bar(
                 district_ids,
@@ -612,11 +612,11 @@ class Model:
 
         percentiles = [2.5, 97.5]
 
-        id_col = self.settings.district_census['id_column']
-        pop_col = self.settings.district_census['pop_column']
+        id_col = self.settings.census['id_column']
+        pop_col = self.settings.census['pop_column']
 
         # --- Load census: dict {district_id: population} ---
-        census_source = self.settings.district_census['path']
+        census_source = self.settings.census['path']
         census_df = pd.read_csv(census_source)
         census = dict(zip(census_df[id_col], census_df[pop_col]))
         del census_df
@@ -635,7 +635,7 @@ class Model:
                 src[k] = rasterio.open(self.settings.covariate[k], 'r')
 
             logger.debug("Opening mastergrid")
-            mst = rasterio.open(self.settings.district_mastergrid, 'r')
+            mst = rasterio.open(self.settings.mastergrid, 'r')
             mst_arr = mst.read(1)  # load toàn bộ mastergrid vào RAM (raster 100m/VN ~ vài trăm MB, chấp nhận được)
 
             profile = mst.profile.copy()
@@ -740,7 +740,7 @@ class Model:
                 with progress_lock:
                     progress['done'] += 1
                     if progress['done'] % 10 == 0 or progress['done'] == progress['total']:
-                        logger.info(f"District progress: {progress['done']}/{progress['total']} "
+                        logger.info(f"Admins progress: {progress['done']}/{progress['total']} "
                                     f"({100*progress['done']/progress['total']:.1f}%)")
 
             with ThreadPoolExecutor(max_workers=self.settings.max_workers) as executor:
