@@ -16,7 +16,7 @@ from sklearn.preprocessing import RobustScaler
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import cross_validate
 from sklearn.inspection import permutation_importance
-from .base_model import BaseEstimator, GLMEstimator, RandomForestEstimator, QuantileForestIntervalEstimator  # thêm import
+from .base_model import BaseEstimator, GLMEstimator, RandomForestEstimator, QuantileForestIntervalEstimator, BARTEstimator  # thêm import
 from rasterio.windows import Window
 import pymc as pm
 import pymc_bart as pmb
@@ -127,7 +127,7 @@ class Model:
             self.model = self._estimator
             logger.debug(f"Initialized {self.model.__class__.__name__}")
 
-            if not isinstance(self.model, (GLMEstimator, QuantileForestIntervalEstimator)):
+            if not isinstance(self.model, (GLMEstimator, QuantileForestIntervalEstimator, BARTEstimator)):
                 with joblib_resources():
                     logger.info("Performing feature selection")
                     importances, selected = self._select_features(X_scaled, y)
@@ -168,6 +168,103 @@ class Model:
                 self._save_model()
 
         logger.info("Model training completed successfully")
+    def bart_train(self,
+                    data: pd.DataFrame,
+                    model_path: Optional[str] = None,
+                    scaler_path: Optional[str] = None,
+                    log_scale: bool = False,
+                    save_model: bool = True,
+                    draws: int = 250,
+                    tune: int = 1000,
+                    chains: int = 4,
+                    random_seed: int = 42) -> None:
+        """
+        Train PyMC-BART model for population density prediction.
+
+        Args:
+            data: DataFrame containing features and target variables.
+                Must include 'id', 'pop', 'dens' columns
+            model_path: Optional path to load a saved InferenceData (.nc) trace
+            scaler_path: Optional path to load fitted scaler
+            log_scale: Whether to train the model with log(dens)
+            save_model: Whether to save trace/model after training
+            draws, tune, chains: MCMC sampling parameters
+            random_seed: seed for reproducibility
+
+        Raises:
+            ValueError: If input data is invalid
+            RuntimeError: If model/trace loading fails
+        """
+        data = data.dropna()
+
+        if self._estimator.requires_admin_id and 'id' in data.columns:
+            self._estimator.set_admin_ids(data['id'].values)
+
+        drop_cols = np.intersect1d(data.columns.values, ['id', 'pop', 'dens', 'is_commune'])
+        X = data.drop(columns=drop_cols).copy()
+        y = data['dens'].values.astype(float)
+
+        if log_scale:
+            y = np.log(np.maximum(y, 0.1))
+
+        self.target_mean = y.mean()
+        self.feature_names = X.columns.values
+        logger.debug(f"Features selected: {self.feature_names.tolist()}")
+        logger.debug(f"Target mean: {self.target_mean:.4f}")
+
+        # --- Scaler (BART is scale-invariant for X, but keep for consistency/pipeline reuse) ---
+        if scaler_path is None:
+            logger.info("Creating new scaler")
+            self.scaler = RobustScaler()
+            self.scaler.fit(X)
+        else:
+            logger.info(f"Loading scaler from: {scaler_path}")
+            try:
+                self.scaler = joblib.load(scaler_path)
+            except Exception as e:
+                logger.error(f"Failed to load scaler: {str(e)}")
+                raise
+
+        X_scaled = self.scaler.transform(X)
+        self.selected_features = X.columns.values  # BART handles feature relevance internally via variable inclusion
+
+        if model_path is None:
+            logger.info("Training new BART model")
+
+            with pm.Model() as bart_model:
+                X_data = pm.Data("X_data", X_scaled)
+                y_data = pm.Data("y_data", y)
+
+                sigma = pm.HalfNormal("sigma", sigma=y.std())
+                mu = pmb.BART("mu", X_data, y_data, m=50)
+                likelihood = pm.Normal("y_obs", mu=mu, sigma=sigma, observed=y_data)
+
+                logger.info("Sampling started")
+                idata = pm.sample(
+                    draws=draws,
+                    tune=tune,
+                    chains=chains,
+                    random_seed=random_seed,
+                    return_inferencedata=True,
+                )
+
+            self.model = bart_model
+            self.trace = idata
+            logger.debug("BART sampling completed")
+
+        else:
+            logger.info(f"Loading trace from: {model_path}")
+            try:
+                self.trace = az.from_netcdf(model_path)
+            except Exception as e:
+                logger.error(f"Failed to load trace: {str(e)}")
+                raise
+
+        if save_model:
+            logger.info("Saving trace and scaler")
+            self._save_bart_model()
+
+        logger.info("BART training completed successfully")
     def _select_features(self,
                          X: np.ndarray,
                          y: np.ndarray,

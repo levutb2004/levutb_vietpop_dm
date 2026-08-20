@@ -6,10 +6,10 @@ CONFIG=prj_vn_2019/config.yaml
 # MODEL=lr
 #MODEL=rf
 #MODEL=ensemble
-#MODEL=bart
+MODEL=bart
 # MODEL=mlp
 # MODEL=glm
-MODEL=qrf
+#MODEL=qrf
 
 # Default target
 train:

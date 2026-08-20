@@ -415,7 +415,7 @@ class BARTEstimator(BaseEstimator):
         self._selected_features = None
 
     def fit(self, X: np.ndarray, y: np.ndarray, 
-            draws: int = 250, tune: int = 1000,chains: int = 2, random_seed: int = 42) -> 'BARTEstimator':
+            draws: int = 250, tune: int = 1000,chains: int = 4, random_seed: int = 42) -> 'BARTEstimator':
         with pm.Model() as bart_model:
             X_data = pm.Data("X_data", X)
             y_data = pm.Data("y_data", y)

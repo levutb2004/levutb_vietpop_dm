@@ -460,8 +460,10 @@ def run(config_file: str,
         else:
             logger.info("Starting feature extraction...")
             features = feature_extractor.extract(pixel_sample=True)
-            
-        model.train(features, log_scale=settings.log_scale)
+        if model_type == 'bart':
+            model.bart_train(features, log_scale=settings.log_scale)
+        else: 
+            model.train(features, log_scale=settings.log_scale)
 
     logger.info("Making predictions...")
     if model_type == 'bart': 
