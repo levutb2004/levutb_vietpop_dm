@@ -299,22 +299,55 @@ class PixelPopDiagnostics:
         within_pi = (y_true_nz >= lower_nz) & (y_true_nz <= upper_nz)
         above_upper = y_true_nz > upper_nz
         below_lower = y_true_nz < lower_nz
+        mpiw = float(np.mean(upper_nz - lower_nz))
+
+        # Range của ground truth trên tập dùng để đánh giá PI
+        y_min = float(np.min(y_true_nz))
+        y_max = float(np.max(y_true_nz))
+        y_range = y_max - y_min
+
+        # Prediction Interval Normalized Average Width
+        alpha = 0.05
+        eta = 50
+        pinaw = (
+            mpiw / y_range
+            if y_range > 0
+            else np.nan
+        )
+
+        # Coverage target, ví dụ alpha = 0.05 -> mu = 0.95
+        mu = 1.0 - alpha
+
+        # CWC penalty
+        gamma = 1.0 if pct_pi_correct / 100.0 < mu else 0.0
+
+        cwc = (pinaw * (1.0 + gamma * np.exp(-eta * (pct_pi_correct / 100.0 - mu))))
 
         pct_pi_correct = float(np.mean(within_pi)) * 100 if n_nz > 0 else np.nan
         pct_above_upper = float(np.mean(above_upper)) * 100 if n_nz > 0 else np.nan
         pct_below_lower = float(np.mean(below_lower)) * 100 if n_nz > 0 else np.nan
 
         metrics = {
-                    'RMSD': rmsd,
-                    'PercentRMSD': percent_rmsd,
-                    'MAE': mae,
-                    'R2': r2,
-                    'pct_pi_correct': pct_pi_correct,
-                    'pct_above_upper': pct_above_upper,
-                    'pct_below_lower': pct_below_lower,
-                    'n': n,
-                    'n_nonzero_gt': n_nz,
-                }
+            'RMSD': rmsd,
+            'PercentRMSD': percent_rmsd,
+            'MAE': mae,
+            'R2': r2,
+
+            'PICP': pct_pi_correct,
+            'pct_above_upper': pct_above_upper,
+            'pct_below_lower': pct_below_lower,
+
+            'MPIW': mpiw,
+            'PINAW': pinaw,
+            'CWC': cwc,
+
+            'PI_y_min': y_min,
+            'PI_y_max': y_max,
+            'PI_y_range': y_range,
+
+            'n': n,
+            'n_nonzero_gt': n_nz,
+        }
         # Lưu các chỉ số ra csv
         output_csv = Path(self.settings.output_dir) / "pixelpopdiag.csv"
         pd.DataFrame([metrics]).to_csv(output_csv, index=False)
