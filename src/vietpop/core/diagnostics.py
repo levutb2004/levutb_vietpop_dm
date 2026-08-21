@@ -299,13 +299,17 @@ class PixelPopDiagnostics:
         within_pi = (y_true_nz >= lower_nz) & (y_true_nz <= upper_nz)
         above_upper = y_true_nz > upper_nz
         below_lower = y_true_nz < lower_nz
-        mpiw = float(np.mean(upper_nz - lower_nz))
+        pct_pi_correct = float(np.mean(within_pi)) * 100 if n_nz > 0 else np.nan
+        pct_above_upper = float(np.mean(above_upper)) * 100 if n_nz > 0 else np.nan
+        pct_below_lower = float(np.mean(below_lower)) * 100 if n_nz > 0 else np.nan
+        
 
         # Range của ground truth trên tập dùng để đánh giá PI
+        mpiw = float(np.mean(upper_nz - lower_nz))
         y_min = float(np.min(y_true_nz))
         y_max = float(np.max(y_true_nz))
         y_range = y_max - y_min
-
+        
         # Prediction Interval Normalized Average Width
         alpha = 0.05
         eta = 50
@@ -320,12 +324,7 @@ class PixelPopDiagnostics:
 
         # CWC penalty
         gamma = 1.0 if pct_pi_correct / 100.0 < mu else 0.0
-
         cwc = (pinaw * (1.0 + gamma * np.exp(-eta * (pct_pi_correct / 100.0 - mu))))
-
-        pct_pi_correct = float(np.mean(within_pi)) * 100 if n_nz > 0 else np.nan
-        pct_above_upper = float(np.mean(above_upper)) * 100 if n_nz > 0 else np.nan
-        pct_below_lower = float(np.mean(below_lower)) * 100 if n_nz > 0 else np.nan
 
         metrics = {
             'RMSD': rmsd,
