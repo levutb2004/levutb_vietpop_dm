@@ -3,17 +3,16 @@ from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from os import cpu_count
 import numpy as np
-import pandas as pd
 from typing import Any
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.neural_network import MLPRegressor
 from sklearn.linear_model import LinearRegression
+from sklearn.ensemble._forest import _get_n_samples_bootstrap, _generate_sample_indices
 from quantile_forest import RandomForestQuantileRegressor
 from xgboost import XGBRegressor
 from lightgbm import LGBMRegressor
 import pymc as pm
 import pymc_bart as pmb
-import pickle
 from pathlib import Path
 # import torch
 # import torch.nn as nn
@@ -22,8 +21,6 @@ from pathlib import Path
 # from torch.optim.lr_scheduler import ReduceLROnPlateau
 import geopandas as gpd
 from libpysal.weights import Queen
-import gc
-import tempfile, os
 
 class BaseEstimator(ABC):
     """
@@ -113,7 +110,81 @@ class QuantileForestIntervalEstimator(BaseEstimator):
     @selected_features.setter
     def selected_features(self, value):
         self._selected_features = value
+        
+class ForestErrorIntervalEstimator(BaseEstimator):
+    def __init__(self, n_estimators: int = 500, random_state: int = 42, **kwargs):
+        self._model = RandomForestRegressor(
+            n_estimators=n_estimators,
+            random_state=random_state,
+            **kwargs
+        )
+        self._oob_error = None
+        self._selected_features = None
 
+    def fit(self, X: np.ndarray, y: np.ndarray) -> "ForestErrorIntervalEstimator":
+        forest = self._model
+        forest.fit(X, y)
+ 
+        # Terminal node (leaf) index of every training sample, per tree
+        train_terminal_nodes = forest.apply(X)  # (n_samples, n_trees)
+ 
+        # OOB errors (single-output)
+        oob_error = forest.predict(X) - y  # (n_samples,)
+ 
+        n_samples = X.shape[0]
+ 
+        # self._oob_lookup[t] = {terminal_node_id: sorted np.ndarray of OOB errors}
+        self._oob_lookup = []
+        for t, tree in enumerate(forest.estimators_):
+            n_samples_bootstrap = _get_n_samples_bootstrap(n_samples, max_samples=None, sample_weight=None)
+            sampled_indices = _generate_sample_indices(tree.random_state, n_samples, n_samples_bootstrap, sample_weight=None)
+ 
+            in_bag_mask = np.zeros(n_samples, dtype=bool)
+            in_bag_mask[sampled_indices] = True
+            oob_mask = ~in_bag_mask
+ 
+            nodes = train_terminal_nodes[oob_mask, t]
+            errs = oob_error[oob_mask]
+ 
+            order = np.argsort(nodes)
+            nodes_sorted = nodes[order]
+            errs_sorted = errs[order]
+            unique_nodes, start_idx = np.unique(nodes_sorted, return_index=True)
+            groups = np.split(errs_sorted, start_idx[1:])
+ 
+            self._oob_lookup.append({
+                int(node_id): np.sort(g) for node_id, g in zip(unique_nodes, groups)
+            })
+ 
+        return self
+
+    def predict(self, X: np.ndarray) -> np.ndarray:
+        """Point prediction (RF mean prediction)."""
+        return self._model.predict(X)
+
+    def predict_quantiles(self, X, quantiles=(0.05, 0.5, 0.95)):
+        forest = self._model
+        preds = forest.predict(X)
+        terminal_nodes = forest.apply(X)          # (n_samples, n_trees)
+        n = X.shape[0]
+        out = np.empty((n, len(quantiles)))
+        for j in range(n):
+            errs = np.concatenate([
+                self._oob_lookup[t].get(terminal_nodes[j, t], np.array([]))
+                for t in range(forest.n_estimators)
+            ])
+            errs.sort()
+            L = len(errs)
+            for k, q in enumerate(quantiles):
+                out[j, k] = preds[j] + errs[int(L * q)]
+        return out
+    @property
+    def selected_features(self):
+        return self._selected_features
+
+    @selected_features.setter
+    def selected_features(self, value):
+        self._selected_features = value
 class NeuralNetEstimator(BaseEstimator):
     """Example: MLP-based estimator."""
 

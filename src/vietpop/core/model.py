@@ -16,7 +16,7 @@ from sklearn.preprocessing import RobustScaler
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.model_selection import cross_validate
 from sklearn.inspection import permutation_importance
-from .base_model import BaseEstimator, GLMEstimator, RandomForestEstimator, QuantileForestIntervalEstimator, BARTEstimator  # thêm import
+from .base_model import BaseEstimator, GLMEstimator, RandomForestEstimator, QuantileForestIntervalEstimator, BARTEstimator, ForestErrorIntervalEstimator  # thêm import
 from rasterio.windows import Window
 import pymc as pm
 import pymc_bart as pmb
@@ -127,7 +127,7 @@ class Model:
             self.model = self._estimator
             logger.debug(f"Initialized {self.model.__class__.__name__}")
 
-            if not isinstance(self.model, (GLMEstimator, QuantileForestIntervalEstimator, BARTEstimator)):
+            if not isinstance(self.model, (GLMEstimator, QuantileForestIntervalEstimator, BARTEstimator, ForestErrorIntervalEstimator)):
                 with joblib_resources():
                     logger.info("Performing feature selection")
                     importances, selected = self._select_features(X_scaled, y)

@@ -26,7 +26,8 @@ from ..core.base_model import \
     RandomForestEstimator, \
     NeuralNetEstimator, \
     BARTEstimator, \
-    QuantileForestIntervalEstimator#, PyTorchEstimator
+    QuantileForestIntervalEstimator, \
+    ForestErrorIntervalEstimator#, PyTorchEstimator
 from ..utils.mlflow_tracker import (
     log_diagnostics, setup_mlflow, start_run,
     log_settings, log_estimator_params,
@@ -45,6 +46,7 @@ ESTIMATOR_MAP = {
     'ensemble': EnsembleEstimator,
     'glm':     GLMEstimator,
     'bart':     BARTEstimator,
+    'rferror': ForestErrorIntervalEstimator,
     # 'pytorch': PyTorchEstimator,
 }
 
@@ -468,7 +470,7 @@ def run(config_file: str,
     logger.info("Making predictions...")
     if model_type == 'bart': 
         predictions = model.predict_bart_grid(log_scale=settings.log_scale)
-    elif model_type == 'qrf':
+    elif model_type in ('rferror', 'qrf') :
         predictions = model.predict_grid_interval(log_scale=settings.log_scale)
     else:
         predictions = model.predict_grid(log_scale=settings.log_scale)
@@ -476,7 +478,7 @@ def run(config_file: str,
     mapper = DasymetricMapper(settings)
 
     logger.info("Performing dasymetric mapping...")
-    if model_type != 'bart':
+    if model_type not in ('rferror', 'qrf', 'bart'):
         if settings.district_dm:
             logger.info("Using district-level dasymetric mapping (map_district)")
             mapper.map_district(predictions)

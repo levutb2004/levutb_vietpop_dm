@@ -10,6 +10,7 @@ MODEL=bart
 # MODEL=mlp
 # MODEL=glm
 #MODEL=qrf
+#MODEL=rferror
 
 # Default target
 train:
